@@ -87,7 +87,8 @@ class AdminBroadcastState(StatesGroup):
 HELP = """<b>⚙️ Настройки бота</b>
 
 Здесь доступны товары, цены, описания, видимость в каталоге,
-база аккаунтов, остатки, выдача заказов, рассылка и резервная копия.
+база аккаунтов, остатки, выдача заказов, рассылка, технический режим
+и резервная копия.
 
 Остаток нельзя увеличивать произвольным числом: он меняется только при
 загрузке или списании конкретных аккаунтов."""
@@ -146,6 +147,7 @@ def _translation_note(result: LocalizationResult) -> str:
 async def _admin_panel_text(db: Database, config: Config) -> str:
     stats = await db.get_stats()
     sales_enabled = await db.get_sales_enabled(default=config.payments_enabled)
+    maintenance_enabled = await db.get_maintenance_enabled(default=False)
     return (
         HELP
         + "\n\n"
@@ -159,6 +161,8 @@ async def _admin_panel_text(db: Database, config: Config) -> str:
         + f"Оплачены, ждут выдачи: {stats.paid}\n\n"
         + "Приём платежей Binance Pay: "
         + ("🟢 включён" if sales_enabled else "🔴 выключен")
+        + "\nТехнический режим: "
+        + ("🛠 включён" if maintenance_enabled else "✅ выключен")
     )
 
 
@@ -464,6 +468,20 @@ async def admin_action(
         with contextlib.suppress(TelegramAPIError):
             await callback.message.edit_reply_markup(reply_markup=None)
         await callback.message.answer("Рассылка отменена.", reply_markup=admin_panel_keyboard())
+        return
+    if callback_data.action in {"maintenance_on", "maintenance_off"}:
+        enabled = callback_data.action == "maintenance_on"
+        await state.clear()
+        await db.set_maintenance_enabled(enabled, updated_by=callback.from_user.id)
+        await callback.answer(
+            "Технический режим включён. Доступ обычных пользователей приостановлен."
+            if enabled
+            else "Технические работы завершены. Бот снова доступен пользователям."
+        )
+        await callback.message.answer(
+            await _admin_panel_text(db, config),
+            reply_markup=admin_panel_keyboard(),
+        )
         return
     if callback_data.action in {"sales_on", "sales_off"}:
         enabled = callback_data.action == "sales_on"

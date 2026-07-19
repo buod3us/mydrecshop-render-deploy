@@ -16,6 +16,7 @@ from .bootstrap import bootstrap_database_from_encrypted_snapshot
 from .config import Config
 from .db import Database
 from .handlers import admin_router, user_router
+from .handlers.user import MaintenanceModeMiddleware
 from .seed import seed_catalog
 from .subscription import subscription_verifier
 
@@ -184,6 +185,9 @@ async def run(config: Config | None = None) -> None:
         ),
     )
     dispatcher = Dispatcher()
+    maintenance_mode_middleware = MaintenanceModeMiddleware()
+    dispatcher.message.outer_middleware(maintenance_mode_middleware)
+    dispatcher.callback_query.outer_middleware(maintenance_mode_middleware)
     dispatcher.include_router(admin_router)
     dispatcher.include_router(user_router)
 

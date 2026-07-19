@@ -123,6 +123,7 @@ type TextKey = Literal[
     "subscription.not_joined",
     "subscription.verified",
     "subscription.unavailable",
+    "maintenance.message",
     "support.message",
     "support.open",
     "admin.only",
@@ -363,6 +364,10 @@ _RU: dict[str, str] = {
     "subscription.not_joined": "Подписка пока не найдена. Подпишитесь и проверьте ещё раз.",
     "subscription.verified": "✅ Подписка подтверждена!",
     "subscription.unavailable": "Не удалось проверить подписку. Попробуйте немного позже.",
+    "maintenance.message": (
+        "<b>🛠 Бот временно находится на техническом обслуживании.</b>\n\n"
+        "Мы обновляем магазин. Пожалуйста, попробуйте снова немного позже."
+    ),
     "support.message": (
         "<b>{support_icon} Поддержка</b>\n\n"
         "Если у вас возник вопрос по товару или заказу, "
@@ -605,6 +610,10 @@ _EN: dict[str, str] = {
     "subscription.not_joined": "Subscription not found yet. Join the channel and try again.",
     "subscription.verified": "✅ Subscription confirmed!",
     "subscription.unavailable": "Could not verify your subscription. Please try again shortly.",
+    "maintenance.message": (
+        "<b>🛠 The bot is temporarily under maintenance.</b>\n\n"
+        "We are updating the store. Please try again a little later."
+    ),
     "support.message": (
         "<b>{support_icon} Support</b>\n\n"
         "If you have a question about a product or an order, message @{support}.\n\n"

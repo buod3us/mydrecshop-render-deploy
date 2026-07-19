@@ -592,6 +592,16 @@ def admin_panel_keyboard() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
+                    text="🛠 Включить техработы",
+                    callback_data=AdminActionCallback(action="maintenance_on").pack(),
+                ),
+                InlineKeyboardButton(
+                    text="✅ Завершить техработы",
+                    callback_data=AdminActionCallback(action="maintenance_off").pack(),
+                ),
+            ],
+            [
+                InlineKeyboardButton(
                     text="➕ Добавить товар",
                     callback_data=AdminActionCallback(action="create").pack(),
                 )

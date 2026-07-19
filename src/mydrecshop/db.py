@@ -51,6 +51,10 @@ class SalesDisabled(ShopDatabaseError):
     pass
 
 
+class MaintenanceEnabled(ShopDatabaseError):
+    pass
+
+
 class ProductPriceChanged(ShopDatabaseError):
     def __init__(self, *, expected: int, current: int) -> None:
         self.expected = expected
@@ -460,6 +464,14 @@ class Database:
                     _to_db_datetime(_utc_now()),
                 ),
             )
+            await connection.execute(
+                """
+                INSERT INTO shop_settings(key, value, updated_at, updated_by)
+                VALUES ('maintenance_enabled', '0', ?, NULL)
+                ON CONFLICT(key) DO NOTHING
+                """,
+                (_to_db_datetime(_utc_now()),),
+            )
             product_columns = {
                 str(row["name"])
                 for row in await _fetchall(connection, "PRAGMA table_info(products)")
@@ -588,6 +600,66 @@ class Database:
                     """
                     INSERT INTO shop_settings(key, value, updated_at, updated_by)
                     VALUES ('sales_enabled', ?, ?, ?)
+                    ON CONFLICT(key) DO UPDATE SET
+                        value = excluded.value,
+                        updated_at = excluded.updated_at,
+                        updated_by = excluded.updated_by
+                    """,
+                    ("1" if enabled else "0", now, updated_by),
+                )
+        return enabled
+
+    async def ensure_maintenance_enabled(self, default: bool = False) -> bool:
+        """Create the maintenance switch once without overwriting admin changes."""
+
+        now = _to_db_datetime(_utc_now())
+        async with self._lock:
+            connection = self._require_connection()
+            async with self._transaction(connection):
+                await _execute(
+                    connection,
+                    """
+                    INSERT INTO shop_settings(key, value, updated_at, updated_by)
+                    VALUES ('maintenance_enabled', ?, ?, NULL)
+                    ON CONFLICT(key) DO NOTHING
+                    """,
+                    ("1" if default else "0", now),
+                )
+                row = await _fetchone(
+                    connection,
+                    "SELECT value FROM shop_settings WHERE key = 'maintenance_enabled'",
+                )
+        return row is not None and str(row["value"]) == "1"
+
+    async def get_maintenance_enabled(self, *, default: bool = False) -> bool:
+        """Return whether ordinary-user interactions are temporarily paused."""
+
+        async with self._lock:
+            row = await _fetchone(
+                self._require_connection(),
+                "SELECT value FROM shop_settings WHERE key = 'maintenance_enabled'",
+            )
+        if row is None:
+            return default
+        return str(row["value"]) == "1"
+
+    async def set_maintenance_enabled(
+        self,
+        enabled: bool,
+        *,
+        updated_by: int | None = None,
+    ) -> bool:
+        """Persist an idempotent administrator-selected maintenance state."""
+
+        now = _to_db_datetime(_utc_now())
+        async with self._lock:
+            connection = self._require_connection()
+            async with self._transaction(connection):
+                await _execute(
+                    connection,
+                    """
+                    INSERT INTO shop_settings(key, value, updated_at, updated_by)
+                    VALUES ('maintenance_enabled', ?, ?, ?)
                     ON CONFLICT(key) DO UPDATE SET
                         value = excluded.value,
                         updated_at = excluded.updated_at,
@@ -1793,6 +1865,12 @@ class Database:
                     current = explicit_current or _utc_now()
                     current_db = _to_db_datetime(current)
                     expires_db = _to_db_datetime(current + reservation_ttl)
+                    maintenance_row = await _fetchone(
+                        connection,
+                        "SELECT value FROM shop_settings WHERE key = 'maintenance_enabled'",
+                    )
+                    if maintenance_row is not None and str(maintenance_row["value"]) == "1":
+                        raise MaintenanceEnabled("shop is in maintenance mode")
                     sales_row = await _fetchone(
                         connection,
                         "SELECT value FROM shop_settings WHERE key = 'sales_enabled'",

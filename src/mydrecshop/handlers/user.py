@@ -38,6 +38,7 @@ from ..db import (
     Database,
     InsufficientStock,
     LatePaymentRequiresRefund,
+    MaintenanceEnabled,
     PendingOrderExists,
     ProductPriceChanged,
     ProductUnavailable,
@@ -200,6 +201,58 @@ async def _ensure_user(tg_user: TgUser, db: Database, config: Config) -> User:
 async def _subscription_locale(tg_user: TgUser, db: Database, config: Config) -> str:
     existing = await db.get_user(tg_user.id)
     return existing.locale.value if existing is not None else _initial_locale(tg_user, config)
+
+
+class MaintenanceModeMiddleware(BaseMiddleware):
+    """Pause ordinary-user interactions while keeping administrator access."""
+
+    async def __call__(
+        self,
+        handler: Callable[[Message | CallbackQuery, dict[str, Any]], Awaitable[Any]],
+        event: Message | CallbackQuery,
+        data: dict[str, Any],
+    ) -> Any:
+        config: Config = data["config"]
+        tg_user = event.from_user
+        if tg_user is None or config.is_admin(tg_user.id):
+            return await handler(event, data)
+
+        # The global middleware is intentionally limited to private bot chats.
+        # It must not answer in groups where the bot might receive an update.
+        event_chat = (
+            event.chat
+            if isinstance(event, Message)
+            else getattr(event.message, "chat", None)
+        )
+        if event_chat is not None and event_chat.type != ChatType.PRIVATE:
+            return await handler(event, data)
+
+        # Financial service updates must always reach reconciliation handlers,
+        # even while the interactive storefront is paused.
+        if isinstance(event, Message) and (
+            event.successful_payment is not None or event.refunded_payment is not None
+        ):
+            return await handler(event, data)
+
+        db: Database = data["db"]
+        getter = getattr(db, "get_maintenance_enabled", None)
+        if getter is None or not await getter(default=False):
+            return await handler(event, data)
+
+        try:
+            locale = await _subscription_locale(tg_user, db, config)
+        except Exception:
+            logger.exception(
+                "Could not load locale for maintenance response to user %s",
+                tg_user.id,
+            )
+            locale = _initial_locale(tg_user, config)
+
+        if isinstance(event, Message):
+            await event.answer(t("maintenance.message", locale))
+        else:
+            await event.answer(t("error.maintenance", locale, escape_html=False), show_alert=True)
+        return None
 
 
 class RequiredSubscriptionMiddleware(BaseMiddleware):
@@ -1139,6 +1192,9 @@ async def checkout(
         return
     except SalesDisabled:
         await message.answer(_sales_disabled_text(locale))
+        return
+    except MaintenanceEnabled:
+        await message.answer(t("maintenance.message", locale))
         return
     except ProductPriceChanged:
         await message.answer(t("purchase.price_changed", locale))
