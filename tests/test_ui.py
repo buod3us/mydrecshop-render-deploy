@@ -62,7 +62,14 @@ from mydrecshop.keyboards import (
 )
 from mydrecshop.models import Locale, Product, ProductPriceTier, User
 from mydrecshop.subscription import SubscriptionVerifier
-from mydrecshop.views import home_text, product_text, profile_text, purchase_text, terms_text
+from mydrecshop.views import (
+    home_text,
+    product_text,
+    profile_text,
+    purchase_text,
+    restock_notification_text,
+    terms_text,
+)
 
 
 def product(**changes: object) -> Product:
@@ -217,6 +224,30 @@ def test_admin_product_title_renders_saved_custom_emoji() -> None:
 
     assert '<tg-emoji emoji-id="5368324170671202286">📧</tg-emoji>' in rendered
     assert "<b>Hotmail - Outlook Mail</b>" in rendered
+
+
+def test_restock_notification_uses_product_custom_emoji_with_unicode_fallback() -> None:
+    item = product(
+        name_ru="ChatGPT Plus",
+        name_en="ChatGPT Plus",
+        emoji="📱",
+        custom_emoji_id="5368324170671202286",
+    )
+
+    custom = restock_notification_text(item, "ru", added=3)
+    fallback = restock_notification_text(
+        item,
+        "en",
+        added=3,
+        use_custom_emoji=False,
+    )
+
+    assert (
+        '<tg-emoji emoji-id="5368324170671202286">📱</tg-emoji> ChatGPT Plus'
+        in custom
+    )
+    assert "<tg-emoji" not in fallback
+    assert "📱 ChatGPT Plus" in fallback
 
 
 def test_product_name_input_separates_custom_emoji_using_utf16_offsets() -> None:
@@ -833,7 +864,11 @@ async def test_restock_notification_uses_each_users_language() -> None:
     ]
     db = SimpleNamespace(list_users=AsyncMock(side_effect=[users, []]))
     bot = SimpleNamespace(send_message=AsyncMock())
-    localized_product = product(name_ru="Русский товар", name_en="English product")
+    localized_product = product(
+        name_ru="Русский товар",
+        name_en="English product",
+        custom_emoji_id="5368324170671202286",
+    )
 
     sent, failed = await _notify_restock_users(  # type: ignore[arg-type]
         bot,
@@ -847,10 +882,12 @@ async def test_restock_notification_uses_each_users_language() -> None:
     russian_call, english_call = bot.send_message.await_args_list
     assert russian_call.args[0] == 101
     assert "Пополнение товара" in russian_call.args[1]
+    assert '<tg-emoji emoji-id="5368324170671202286">📧</tg-emoji>' in russian_call.args[1]
     assert "Русский товар" in russian_call.args[1]
     assert russian_call.kwargs["reply_markup"].inline_keyboard[0][0].text == "🛒 Открыть товар"
     assert english_call.args[0] == 202
     assert "Product restocked" in english_call.args[1]
+    assert '<tg-emoji emoji-id="5368324170671202286">📧</tg-emoji>' in english_call.args[1]
     assert "English product" in english_call.args[1]
     assert english_call.kwargs["reply_markup"].inline_keyboard[0][0].text == "🛒 Open product"
 

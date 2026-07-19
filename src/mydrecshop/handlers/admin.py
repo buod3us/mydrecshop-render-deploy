@@ -297,7 +297,7 @@ async def _send_database_backup(message: Message, db: Database, config: Config) 
         await message.answer_document(
             document=document,
             caption=caption,
-            protect_content=True,
+            protect_content=False,
         )
 
 
@@ -854,7 +854,7 @@ async def admin_product_action(
         await state.set_state(AdminProductState.restock_items)
         await state.update_data(product_id=product.id)
         await callback.message.answer(
-            f"<b>Пополнение: {escape(product.name_ru)}</b>\n\n"
+            f"<b>Пополнение:</b> {_admin_product_title(product)}\n\n"
             "Вставьте аккаунты текстом — один аккаунт на каждой непустой строке. "
             "Можно также прислать UTF-8 файл .txt. Дубликаты будут пропущены.\n\n"
             "Для отмены: /cancel"
@@ -1292,7 +1292,7 @@ async def restock_product_items(
     else:
         notification_note = "\nТовар скрыт, поэтому рассылка не выполнялась."
     await message.answer(
-        f"✅ <b>{escape(product.name_ru)}</b> пополнен.\n"
+        f"✅ {_admin_product_title(product)} пополнен.\n"
         f"Добавлено: {added}\nДубликатов пропущено: {duplicates}\n"
         f"Новый остаток: {product.stock}\n"
         f"Уведомления: отправлено {sent}, недоступно {failed}.{notification_note}",
@@ -1548,7 +1548,7 @@ async def deliver_stored_accounts(
                         order.user_id,
                         rendered,
                         reply_markup=keyboard,
-                        protect_content=True,
+                        protect_content=False,
                     ),
                     lambda custom: themed_header(custom) + safe_body,
                 )
@@ -1562,7 +1562,7 @@ async def deliver_stored_accounts(
                             filename=f"order-{order.id}-accounts.txt",
                         ),
                         caption=rendered,
-                        protect_content=True,
+                        protect_content=False,
                     ),
                     lambda custom: (
                         f"{theme_html('delivery', use_custom=custom)} Order #{order.id}: "
@@ -2007,7 +2007,7 @@ async def _deliver_locked(
             order.user_id,
             header + payload,
             parse_mode=None,
-            protect_content=True,
+            protect_content=False,
         )
     except TelegramAPIError:
         logger.exception("Telegram did not confirm delivery for order %s", order.id)

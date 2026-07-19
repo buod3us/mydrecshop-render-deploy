@@ -450,7 +450,7 @@ _RU: dict[str, str] = {
     ),
     "notification.restock": (
         "<b>{restock_icon} Пополнение товара!</b>\n\n"
-        "{name}\n"
+        "{product_emoji} {name}\n"
         "{quantity_icon} Добавлено: <b>+{added}</b>\n"
         "{stock_icon} Сейчас в наличии: <b>{stock}</b>"
     ),
@@ -769,7 +769,7 @@ _EN: dict[str, str] = {
     ),
     "notification.restock": (
         "<b>{restock_icon} Product restocked!</b>\n\n"
-        "{name}\n"
+        "{product_emoji} {name}\n"
         "{quantity_icon} Added: <b>+{added}</b>\n"
         "{stock_icon} Currently available: <b>{stock}</b>"
     ),

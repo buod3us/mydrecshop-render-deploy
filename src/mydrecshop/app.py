@@ -188,6 +188,7 @@ async def run(config: Config | None = None) -> None:
         default=DefaultBotProperties(
             parse_mode=ParseMode.HTML,
             link_preview_is_disabled=True,
+            protect_content=False,
         ),
     )
     dispatcher = Dispatcher()

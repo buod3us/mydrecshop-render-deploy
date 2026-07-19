@@ -23,6 +23,19 @@ def _theme_value(role: str, *, use_custom_emoji: bool) -> TrustedHTML:
     return TrustedHTML(theme_html(role, use_custom=use_custom_emoji))
 
 
+def _product_emoji_value(
+    product: Product,
+    *,
+    use_custom_emoji: bool,
+) -> str | TrustedHTML:
+    if use_custom_emoji and product.custom_emoji_id:
+        return TrustedHTML(
+            f'<tg-emoji emoji-id="{escape(product.custom_emoji_id, quote=True)}">'
+            f"{escape(product.emoji or '▫️')}</tg-emoji>"
+        )
+    return product.emoji
+
+
 def home_text(
     locale: LanguageLike,
     support_username: str,
@@ -67,12 +80,7 @@ def product_text(
         key = "product.card_reserved"
     else:
         key = "product.card_out_of_stock"
-    emoji: str | TrustedHTML = product.emoji
-    if use_custom_emoji and product.custom_emoji_id:
-        emoji = TrustedHTML(
-            f'<tg-emoji emoji-id="{escape(product.custom_emoji_id, quote=True)}">'
-            f"{escape(product.emoji)}</tg-emoji>"
-        )
+    emoji = _product_emoji_value(product, use_custom_emoji=use_custom_emoji)
     base_price = (
         price_tiers[0].unit_price_usdt_micros
         if price_tiers
@@ -424,6 +432,10 @@ def restock_notification_text(
         "notification.restock",
         language,
         name=product.name(language.value),
+        product_emoji=_product_emoji_value(
+            product,
+            use_custom_emoji=use_custom_emoji,
+        ),
         added=added,
         stock=product.stock,
         restock_icon=_theme_value("restock", use_custom_emoji=use_custom_emoji),
