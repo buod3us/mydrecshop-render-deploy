@@ -1836,7 +1836,7 @@ async def receive_binance_transfer_id(
     product = await db.get_product(order.product_id)
     safe_transfer_id = escape(transfer_id)
     customer = await db.get_user(order.user_id)
-    locale = customer.locale.value if customer is not None else "ru"
+    locale = customer.locale.value if customer is not None else config.default_locale
     await send_themed_text(
         lambda rendered, keyboard: message.answer(rendered, reply_markup=keyboard),
         lambda custom: (
@@ -1862,7 +1862,11 @@ async def receive_binance_transfer_id(
 
 
 @router.pre_checkout_query()
-async def pre_checkout(query: PreCheckoutQuery, db: Database) -> None:
+async def pre_checkout(
+    query: PreCheckoutQuery,
+    db: Database,
+    config: Config | None = None,
+) -> None:
     try:
         await db.validate_pre_checkout(
             user_id=query.from_user.id,
@@ -1873,7 +1877,14 @@ async def pre_checkout(query: PreCheckoutQuery, db: Database) -> None:
         )
     except Exception:
         logger.warning("Rejected pre-checkout query %s", query.id, exc_info=True)
-        locale = "en" if (query.from_user.language_code or "").startswith("en") else "ru"
+        # A pre-checkout update can arrive before the user row is created.  In
+        # that edge case use the configured first-run language (English by
+        # default) instead of silently falling back to Russian.
+        locale = (
+            "en"
+            if (query.from_user.language_code or "").lower().startswith("en")
+            else (config.default_locale if config is not None else "en")
+        )
         await query.answer(ok=False, error_message=t("payment.invalid", locale, escape_html=False))
         return
     await query.answer(ok=True)

@@ -1410,7 +1410,7 @@ async def confirm_binance_payment(
             )
     with contextlib.suppress(TelegramAPIError):
         customer = await db.get_user(order.user_id)
-        locale = customer.locale.value if customer is not None else "ru"
+        locale = customer.locale.value if customer is not None else config.default_locale
         await send_themed_text(
             lambda rendered, keyboard: bot.send_message(
                 order.user_id,
@@ -1452,7 +1452,7 @@ async def reject_binance_payment(
             await callback.message.edit_reply_markup(reply_markup=None)
     with contextlib.suppress(TelegramAPIError):
         customer = await db.get_user(order.user_id)
-        locale = customer.locale.value if customer is not None else "ru"
+        locale = customer.locale.value if customer is not None else config.default_locale
         await send_themed_text(
             lambda rendered, keyboard: bot.send_message(
                 order.user_id,
@@ -1511,7 +1511,7 @@ async def deliver_stored_accounts(
         product = await db.get_product(order.product_id)
         product_name = product.name("ru") if product else f"товар #{order.product_id}"
         customer = await db.get_user(order.user_id)
-        locale = customer.locale.value if customer is not None else "ru"
+        locale = customer.locale.value if customer is not None else config.default_locale
         if product is not None:
             product_name = product.name(locale)
         elif locale == "en":
@@ -1996,7 +1996,7 @@ async def _deliver_locked(
         )
         return
     user = await db.get_user(order.user_id)
-    locale = user.locale.value if user else "ru"
+    locale = user.locale.value if user else "en"
     header = (
         f"📨 Your order #{order.id}\n\nDigital product data:\n"
         if locale == "en"
@@ -2081,7 +2081,7 @@ async def _refund_locked(
             f"{format_usdt(restored)} USDT."
         )
         customer = await db.get_user(order.user_id)
-        locale = customer.locale if customer is not None else Locale.RU
+        locale = customer.locale if customer is not None else Locale.EN
         notification = (
             f"↩️ Refund for order #{order.id}: {format_usdt(restored)} USDT was "
             f"returned to your wallet. Current balance: {format_usdt(balance)} USDT."

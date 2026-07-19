@@ -893,12 +893,12 @@ ALL_TEXT_KEYS: frozenset[str] = frozenset(_RU)
 
 def normalize_language(
     language: LanguageLike,
-    default: LanguageLike = Language.RU,
+    default: LanguageLike = Language.EN,
 ) -> Language:
     """Normalize Telegram-style locale values such as ``ru-RU`` and ``en_US``.
 
     Unsupported and empty values safely fall back to ``default``.  An invalid
-    default falls back to Russian, so this function never raises on user data.
+    default falls back to English, so this function never raises on user data.
     """
 
     if isinstance(language, Language):
@@ -914,7 +914,7 @@ def normalize_language(
     default_value = str(default or "").strip().lower().replace("_", "-").split("-", 1)[0]
     if default_value in {Language.RU.value, Language.EN.value}:
         return Language(default_value)
-    return Language.RU
+    return Language.EN
 
 
 class _SafeValues(dict[str, str]):
@@ -965,7 +965,7 @@ def safe_format(
 class Translator:
     """Typed, immutable translator suitable for dependency injection."""
 
-    default_language: LanguageLike = Language.RU
+    default_language: LanguageLike = Language.EN
     strict: bool = False
 
     @property

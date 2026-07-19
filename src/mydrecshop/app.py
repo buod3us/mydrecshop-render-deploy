@@ -168,7 +168,10 @@ async def _set_commands(bot: Bot) -> None:
         BotCommand(command="paysupport", description="Payment support"),
         BotCommand(command="terms", description="Terms of sale"),
     ]
-    await bot.set_my_commands(commands_ru)
+    # Telegram uses the unscoped command list for users whose client language
+    # is unknown.  Keep that first-run experience in English; Russian remains
+    # available through the language-scoped list below.
+    await bot.set_my_commands(commands_en)
     await bot.set_my_commands(commands_ru, language_code="ru")
     await bot.set_my_commands(commands_en, language_code="en")
 

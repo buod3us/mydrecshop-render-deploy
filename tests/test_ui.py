@@ -16,7 +16,7 @@ from aiogram.types import User as TelegramUser
 from cryptography.fernet import Fernet
 
 import mydrecshop.handlers.user as user_handlers
-from mydrecshop.app import _drain_background_tasks
+from mydrecshop.app import _drain_background_tasks, _set_commands
 from mydrecshop.callbacks import (
     PurchaseCheckoutCallback,
     QuantityCallback,
@@ -37,6 +37,7 @@ from mydrecshop.handlers.user import (
     BinancePaymentState,
     RequiredSubscriptionMiddleware,
     WalletDepositState,
+    _initial_locale,
     change_purchase_quantity,
     checkout,
     pre_checkout,
@@ -786,6 +787,45 @@ def test_config_from_environment(monkeypatch, tmp_path: Path) -> None:
     assert loaded.payments_enabled is True
     assert loaded.required_channel_username == "mydrecsales"
     assert loaded.menu_custom_emojis["catalog"] == "123"
+
+
+def test_english_is_the_first_run_locale(monkeypatch, tmp_path: Path) -> None:
+    """Missing DEFAULT_LOCALE must produce the English storefront default."""
+
+    monkeypatch.setenv("BOT_TOKEN", "123456:abc")
+    monkeypatch.setenv("ADMIN_IDS", "42")
+    monkeypatch.delenv("DEFAULT_LOCALE", raising=False)
+
+    loaded = Config.from_env(tmp_path / "missing.env")
+
+    assert loaded.default_locale == "en"
+    assert Config(bot_token="123456:abc").default_locale == "en"
+
+
+@pytest.mark.parametrize("language_code", [None, "ru", "de", "zh-CN"])
+def test_initial_locale_is_english_for_new_non_english_users(language_code: str | None) -> None:
+    tg_user = TelegramUser(
+        id=987654,
+        is_bot=False,
+        first_name="New buyer",
+        language_code=language_code,
+    )
+
+    assert _initial_locale(tg_user, config(default_locale="en")) == "en"
+
+
+@pytest.mark.asyncio
+async def test_command_menu_defaults_to_english() -> None:
+    bot = AsyncMock()
+
+    await _set_commands(bot)
+
+    calls = bot.set_my_commands.await_args_list
+    assert len(calls) == 3
+    assert calls[0].kwargs == {}
+    assert calls[0].args[0][0].description == "Main menu"
+    assert calls[1].kwargs["language_code"] == "ru"
+    assert calls[2].kwargs["language_code"] == "en"
 
 
 def test_config_rejects_missing_admin(monkeypatch, tmp_path: Path) -> None:

@@ -62,7 +62,9 @@ class Config:
     bot_token: str
     admin_ids: frozenset[int] = field(default_factory=frozenset)
     support_username: str = "AWP_ON"
-    default_locale: str = "ru"
+    # English is the storefront's first-run language.  A user's persisted
+    # choice is still kept in the database and is never overwritten here.
+    default_locale: str = "en"
     database_path: Path = PROJECT_ROOT / "data" / "shop.db"
     banner_path: Path = PROJECT_ROOT / "assets" / "welcome.gif.mp4"
     order_reservation_minutes: int = 10
@@ -95,7 +97,7 @@ class Config:
                 "BOT_TOKEN is missing. Copy .env.example to .env and add the token from @BotFather."
             )
 
-        locale = os.getenv("DEFAULT_LOCALE", "ru").strip().lower()
+        locale = os.getenv("DEFAULT_LOCALE", "en").strip().lower()
         if locale not in {"ru", "en"}:
             raise ConfigError("DEFAULT_LOCALE must be either 'ru' or 'en'")
 

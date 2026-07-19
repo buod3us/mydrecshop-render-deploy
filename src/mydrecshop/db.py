@@ -158,7 +158,7 @@ class LatePaymentRequiresRefund(PaymentValidationError):
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
     telegram_id INTEGER PRIMARY KEY,
-    locale TEXT NOT NULL DEFAULT 'ru' CHECK (locale IN ('ru', 'en')),
+    locale TEXT NOT NULL DEFAULT 'en' CHECK (locale IN ('ru', 'en')),
     balance_usdt_micros INTEGER NOT NULL DEFAULT 0 CHECK (balance_usdt_micros >= 0),
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -950,7 +950,7 @@ class Database:
     async def get_or_create_user(
         self,
         telegram_id: int,
-        locale: Locale | str = Locale.RU,
+        locale: Locale | str = Locale.EN,
     ) -> User:
         if telegram_id <= 0:
             raise ValueError("telegram_id must be positive")
@@ -2622,7 +2622,7 @@ class Database:
                         connection,
                         """
                         INSERT INTO users(telegram_id, locale, created_at, updated_at)
-                        VALUES (?, 'ru', ?, ?)
+                        VALUES (?, 'en', ?, ?)
                         ON CONFLICT(telegram_id) DO NOTHING
                         """,
                         (user_id, current_db, current_db),

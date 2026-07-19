@@ -23,7 +23,7 @@ from mydrecshop.db import (
     ProductUnavailable,
     ReservationExpired,
 )
-from mydrecshop.models import OrderStatus, ProductInput
+from mydrecshop.models import Locale, OrderStatus, ProductInput
 from mydrecshop.seed import seed_catalog
 
 NOW = datetime(2026, 7, 18, 12, 0, tzinfo=UTC)
@@ -51,6 +51,19 @@ async def _hotmail(database: Database):
     product = await database.get_product_by_sku(HOTMAIL_SKU)
     assert product is not None
     return product
+
+
+@pytest.mark.asyncio
+async def test_new_users_default_to_english_without_overwriting_existing_choice(
+    database: Database,
+) -> None:
+    fresh = await database.get_or_create_user(70_001)
+    assert fresh.locale is Locale.EN
+
+    russian = await database.get_or_create_user(70_002, Locale.RU)
+    unchanged = await database.get_or_create_user(70_002)
+    assert russian.locale is Locale.RU
+    assert unchanged.locale is Locale.RU
 
 
 async def _reserved_order(

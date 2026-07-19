@@ -28,7 +28,7 @@ services:
       - key: REQUIRED_CHANNEL_USERNAME
         value: mydrecsales
       - key: DEFAULT_LOCALE
-        value: ru
+        value: en
       - key: DATABASE_PATH
         value: /app/data/shop.db
       - key: BANNER_PATH

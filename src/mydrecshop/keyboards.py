@@ -163,7 +163,7 @@ def catalog_keyboard(
     builder = InlineKeyboardBuilder()
     for product in products:
         usdt = format_usdt(product.legacy_usdt_micros)
-        label = f"{product.name(str(locale or 'ru'))} — {usdt} USDT"
+        label = f"{product.name(str(locale or 'en'))} — {usdt} USDT"
         builder.row(
             _button(
                 label=label,
@@ -212,7 +212,7 @@ def product_keyboard(
             unavailable_fallback = "🚧"
             unavailable_text = (
                 "🚧 Purchases temporarily disabled"
-                if str(locale or "ru") == "en"
+                if str(locale or "en") == "en"
                 else "🚧 Покупки временно выключены"
             )
         builder.row(
@@ -249,7 +249,7 @@ def purchase_keyboard(
     builder = InlineKeyboardBuilder()
     decrease = max(1, quantity - 1)
     increase = min(max_quantity, quantity + 1)
-    quantity_label = "Quantity" if str(locale or "ru") == "en" else "Количество"
+    quantity_label = "Quantity" if str(locale or "en") == "en" else "Количество"
     builder.row(
         _button(
             label=_ICON_ONLY_LABEL,
@@ -557,7 +557,7 @@ def orders_keyboard(
                     "orders.row",
                     locale,
                     order_id=order.id,
-                    name=product.name(str(locale or "ru")),
+                    name=product.name(str(locale or "en")),
                     status=status,
                 ),
                 callback_data=OrderCallback(order_id=order.id).pack(),
@@ -650,7 +650,7 @@ def binance_payment_keyboard(
     icons = config.menu_custom_emojis
     text = (
         "✅ Я оплатил — отправить ID перевода"
-        if str(locale or "ru") == "ru"
+        if str(locale or "en") == "ru"
         else "✅ I paid — send transfer ID"
     )
     return InlineKeyboardMarkup(
