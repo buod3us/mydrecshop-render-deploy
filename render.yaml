@@ -1,0 +1,46 @@
+# yaml-language-server: $schema=https://render.com/schema/render.yaml.json
+version: "1"
+
+services:
+  - type: worker
+    name: mydrecshop-bot-production
+    runtime: docker
+    repo: https://github.com/buod3us/mydrecshop-render-deploy
+    branch: main
+    plan: starter
+    region: frankfurt
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    autoDeployTrigger: commit
+    numInstances: 1
+
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: BINANCE_ID
+        sync: false
+      - key: DATABASE_BOOTSTRAP_KEY
+        sync: false
+      - key: DATABASE_BOOTSTRAP_ENABLED
+        sync: false
+      - key: REQUIRED_CHANNEL_USERNAME
+        value: mydrecsales
+      - key: DEFAULT_LOCALE
+        value: ru
+      - key: DATABASE_PATH
+        value: /app/data/shop.db
+      - key: BANNER_PATH
+        value: /app/assets/welcome.gif.mp4
+      - key: ORDER_RESERVATION_MINUTES
+        value: "10"
+      - key: PAYMENTS_ENABLED
+        value: "true"
+      - key: LOG_LEVEL
+        value: INFO
+
+    disk:
+      name: mydrecshop-production-data
+      mountPath: /app/data
+      sizeGB: 1

@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "description": "Curated MydrecShop UI theme. Unicode fallbacks are semantic and intentionally do not mirror Telegram pack fallbacks.",
+  "icons": {
+    "welcome": {"pack": "FinanceEmoji", "index": 56, "custom_emoji_id": "5267102644886853973", "fallback": "👋"},
+    "support": {"pack": "FinanceEmoji", "index": 52, "custom_emoji_id": "5197288647275071607", "fallback": "💬"},
+    "catalog": {"pack": "FinanceEmoji", "index": 45, "custom_emoji_id": "5278702045883292456", "fallback": "🛒"},
+    "orders": {"pack": "FinanceEmoji", "index": 24, "custom_emoji_id": "5444856076954520455", "fallback": "📦"},
+    "profile": {"pack": "FinanceEmoji", "index": 29, "custom_emoji_id": "5332724926216428039", "fallback": "👤"},
+    "language": {"pack": "FinanceEmoji", "index": 26, "custom_emoji_id": "5224450179368767019", "fallback": "🌍"},
+    "settings": {"pack": "FinanceEmoji", "index": 47, "custom_emoji_id": "5445221832074483553", "fallback": "⚙️"},
+    "back": {"pack": "Lumpre_by_fStikBot", "index": 121, "custom_emoji_id": "6138426315243524571", "fallback": "⬅️"},
+    "description": {"pack": "FinanceEmoji", "index": 18, "custom_emoji_id": "5197269100878907942", "fallback": "📝"},
+    "price": {"pack": "FinanceEmoji", "index": 55, "custom_emoji_id": "5264713049637409446", "fallback": "💰"},
+    "stock": {"pack": "FinanceEmoji", "index": 16, "custom_emoji_id": "5443127283898405358", "fallback": "📦"},
+    "sold": {"pack": "FinanceEmoji", "index": 57, "custom_emoji_id": "5240228673738527951", "fallback": "📊"},
+    "buy": {"pack": "FinanceEmoji", "index": 34, "custom_emoji_id": "5312361253610475399", "fallback": "🛍"},
+    "payment": {"pack": "FinanceEmoji", "index": 15, "custom_emoji_id": "5445353829304387411", "fallback": "💳"},
+    "success": {"pack": "FinanceEmoji", "index": 52, "custom_emoji_id": "5197288647275071607", "fallback": "✅"},
+    "restock": {"pack": "FinanceEmoji", "index": 16, "custom_emoji_id": "5443127283898405358", "fallback": "📥"},
+    "identifier": {"pack": "FinanceEmoji", "index": 24, "custom_emoji_id": "5444856076954520455", "fallback": "🧾"},
+    "quantity": {"pack": "FinanceEmoji", "index": 30, "custom_emoji_id": "5303214794336125778", "fallback": "🔢"},
+    "pending": {"pack": "FinanceEmoji", "index": 31, "custom_emoji_id": "5382194935057372936", "fallback": "⏳"},
+    "unavailable": {"pack": "FinanceEmoji", "index": 32, "custom_emoji_id": "5429518319243775957", "fallback": "⛔"},
+    "calendar": {"pack": "FinanceEmoji", "index": 48, "custom_emoji_id": "5274055917766202507", "fallback": "📅"},
+    "status": {"pack": "FinanceEmoji", "index": 52, "custom_emoji_id": "5197288647275071607", "fallback": "📌"},
+    "delivery": {"pack": "FinanceEmoji", "index": 20, "custom_emoji_id": "5201691993775818138", "fallback": "📨"},
+    "total": {"pack": "FinanceEmoji", "index": 58, "custom_emoji_id": "5287231198098117669", "fallback": "💰"},
+    "decrease": {"pack": "FinanceEmoji", "index": 32, "custom_emoji_id": "5429518319243775957", "fallback": "➖"},
+    "increase": {"pack": "FinanceEmoji", "index": 33, "custom_emoji_id": "5429651785352501917", "fallback": "➕"},
+    "subscription": {"pack": "FinanceEmoji", "index": 52, "custom_emoji_id": "5197288647275071607", "fallback": "🔒"}
+  }
+}
