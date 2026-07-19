@@ -39,6 +39,9 @@ async def _maintenance(
             expired = await db.cleanup_expired_orders()
             if expired:
                 logger.info("Released %s expired order reservations", expired)
+            expired_deposits = await db.cleanup_expired_balance_deposits()
+            if expired_deposits:
+                logger.info("Expired %s abandoned wallet deposits", expired_deposits)
             for order in await db.list_pending_late_refunds():
                 charge_id = order.telegram_payment_charge_id
                 if charge_id is None:
@@ -142,6 +145,7 @@ async def _set_commands(bot: Bot) -> None:
         BotCommand(command="start", description="Главное меню"),
         BotCommand(command="catalog", description="Каталог товаров"),
         BotCommand(command="orders", description="Мои заказы"),
+        BotCommand(command="wallet", description="Кошелёк и пополнение"),
         BotCommand(command="support", description="Поддержка"),
         BotCommand(command="paysupport", description="Поддержка по оплате"),
         BotCommand(command="terms", description="Условия продажи"),
@@ -150,6 +154,7 @@ async def _set_commands(bot: Bot) -> None:
         BotCommand(command="start", description="Main menu"),
         BotCommand(command="catalog", description="Product catalog"),
         BotCommand(command="orders", description="My orders"),
+        BotCommand(command="wallet", description="Wallet and top-up"),
         BotCommand(command="support", description="Support"),
         BotCommand(command="paysupport", description="Payment support"),
         BotCommand(command="terms", description="Terms of sale"),
@@ -176,6 +181,7 @@ async def run(config: Config | None = None) -> None:
     ):
         logger.info("Applied the initial ChatGPT wholesale price grid")
     await db.cleanup_expired_orders()
+    await db.cleanup_expired_balance_deposits()
 
     bot = Bot(
         token=config.bot_token,

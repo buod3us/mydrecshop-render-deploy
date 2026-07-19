@@ -47,10 +47,64 @@ class OrderStatus(StrEnum):
         }
 
 
+class BalanceTransactionKind(StrEnum):
+    """Auditable reasons why a customer's USDT balance changed."""
+
+    ADMIN_CREDIT = "admin_credit"
+    ADMIN_DEBIT = "admin_debit"
+    BINANCE_DEPOSIT = "binance_deposit"
+    ORDER_PAYMENT = "order_payment"
+    ORDER_REFUND = "order_refund"
+
+
+class BalanceDepositStatus(StrEnum):
+    """Lifecycle of a customer-requested Binance wallet deposit."""
+
+    AWAITING_PAYMENT = "awaiting_payment"
+    AWAITING_REVIEW = "awaiting_review"
+    CONFIRMED = "confirmed"
+    REJECTED = "rejected"
+    EXPIRED = "expired"
+
+
 @dataclass(frozen=True, slots=True)
 class User:
     telegram_id: int
     locale: Locale
+    created_at: datetime
+    updated_at: datetime
+    balance_usdt_micros: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class BalanceTransaction:
+    id: int
+    user_id: int
+    delta_usdt_micros: int
+    balance_after_usdt_micros: int
+    kind: BalanceTransactionKind
+    order_id: int | None
+    deposit_id: int | None
+    admin_id: int | None
+    note: str
+    idempotency_key: str | None
+    created_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class BalanceDeposit:
+    id: int
+    user_id: int
+    amount_usdt_micros: int
+    payment_note: str
+    binance_transfer_id: str | None
+    status: BalanceDepositStatus
+    reservation_expires_at: datetime | None
+    payment_claimed_at: datetime | None
+    confirmed_at: datetime | None
+    rejected_at: datetime | None
+    expired_at: datetime | None
+    reviewed_by: int | None
     created_at: datetime
     updated_at: datetime
 

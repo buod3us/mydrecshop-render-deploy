@@ -4,6 +4,7 @@ import contextlib
 import logging
 from collections.abc import Awaitable, Callable
 from datetime import UTC, timedelta
+from decimal import Decimal, DecimalException
 from html import escape
 from typing import Any
 
@@ -17,6 +18,8 @@ from aiogram.types import CallbackQuery, Message, PreCheckoutQuery
 from aiogram.types import User as TgUser
 
 from ..callbacks import (
+    BalanceDepositCallback,
+    BalancePayCallback,
     BuyCallback,
     CancelOrderCallback,
     CheckoutCallback,
@@ -31,14 +34,17 @@ from ..callbacks import (
     SubmitBinanceCallback,
     SubscriptionCallback,
     TermsCallback,
+    WalletCallback,
 )
 from ..config import Config
 from ..db import (
     MAX_ORDER_QUANTITY,
     Database,
+    InsufficientBalance,
     InsufficientStock,
     LatePaymentRequiresRefund,
     MaintenanceEnabled,
+    PendingBalanceDepositExists,
     PendingOrderExists,
     ProductPriceChanged,
     ProductUnavailable,
@@ -49,7 +55,9 @@ from ..db import (
 from ..formatting import format_usdt
 from ..i18n import t, translator
 from ..keyboards import (
+    admin_balance_deposit_keyboard,
     admin_payment_keyboard,
+    balance_deposit_keyboard,
     binance_payment_keyboard,
     catalog_keyboard,
     custom_quantity_keyboard,
@@ -62,12 +70,15 @@ from ..keyboards import (
     purchase_keyboard,
     subscription_keyboard,
     support_keyboard,
+    wallet_keyboard,
 )
 from ..media import edit_shop_screen, send_shop_screen, send_themed_text
-from ..models import OrderStatus, Product, ProductPriceTier, User
+from ..models import BalanceDepositStatus, OrderStatus, Product, ProductPriceTier, User
 from ..subscription import subscription_verifier
 from ..theme import theme_html
 from ..views import (
+    admin_balance_deposit_text,
+    balance_deposit_text,
     catalog_text,
     home_text,
     language_text,
@@ -80,6 +91,7 @@ from ..views import (
     subscription_required_text,
     support_text,
     terms_text,
+    wallet_text,
 )
 
 logger = logging.getLogger(__name__)
@@ -96,7 +108,27 @@ class PurchaseQuantityState(StatesGroup):
     quantity = State()
 
 
+class WalletDepositState(StatesGroup):
+    amount = State()
+    transfer_id = State()
+
+
 MIN_PURCHASE_QUANTITY = 1
+MIN_WALLET_DEPOSIT_USDT_MICROS = 1
+
+
+def _parse_wallet_amount(raw: str) -> int | None:
+    try:
+        amount = Decimal(raw.strip().replace(",", "."))
+        if not amount.is_finite() or amount <= 0 or amount > Decimal("1000000"):
+            return None
+        micros = amount * 1_000_000
+        if micros != micros.to_integral_value():
+            return None
+        value = int(micros)
+        return value if value >= MIN_WALLET_DEPOSIT_USDT_MICROS else None
+    except (DecimalException, OverflowError, ValueError):
+        return None
 
 
 def _maximum_purchase_quantity(product: Product) -> int:
@@ -273,14 +305,18 @@ class RequiredSubscriptionMiddleware(BaseMiddleware):
             return await handler(event, data)
         if isinstance(event, CallbackQuery):
             callback_prefix = (event.data or "").partition(":")[0]
-            if callback_prefix in {"sub", "bpay", "bopen"}:
+            if callback_prefix in {"sub", "bpay", "bopen", "bdep"}:
                 return await handler(event, data)
 
         state: FSMContext | None = data.get("state")
         if (
             isinstance(event, Message)
             and state is not None
-            and await state.get_state() == BinancePaymentState.transfer_id.state
+            and await state.get_state()
+            in {
+                BinancePaymentState.transfer_id.state,
+                WalletDepositState.transfer_id.state,
+            }
         ):
             # A buyer who already paid must be able to finish submitting the transfer ID,
             # even if their membership changes while the order is under payment.
@@ -377,6 +413,47 @@ async def _product_unavailable_text(
             minutes=reservation_minutes,
         )
     return t("product.unavailable", locale)
+
+
+async def _wallet_payload(
+    db: Database,
+    user: User,
+) -> tuple[list, bool]:
+    await db.cleanup_expired_balance_deposits()
+    transactions = await db.list_balance_transactions(user.telegram_id, limit=5)
+    active = await db.get_active_balance_deposit(user.telegram_id)
+    return transactions, active is not None
+
+
+async def _notify_admins_about_balance_deposit(
+    bot: Bot,
+    db: Database,
+    config: Config,
+    deposit_id: int,
+) -> None:
+    deposit = await db.get_balance_deposit(deposit_id)
+    if deposit is None:
+        return
+    customer = await db.get_user(deposit.user_id)
+    if customer is None:
+        return
+    text = admin_balance_deposit_text(deposit, customer)
+    for admin_id in config.admin_ids:
+        try:
+            await bot.send_message(
+                admin_id,
+                text,
+                reply_markup=admin_balance_deposit_keyboard(
+                    deposit.id,
+                    can_confirm=bool(deposit.binance_transfer_id),
+                ),
+            )
+        except TelegramAPIError:
+            logger.warning(
+                "Could not notify admin %s about balance deposit %s",
+                admin_id,
+                deposit.id,
+            )
 
 
 @router.message(CommandStart())
@@ -498,6 +575,34 @@ async def orders_command(message: Message, db: Database, config: Config, state: 
     )
 
 
+@router.message(Command("wallet"))
+async def wallet_command(
+    message: Message,
+    db: Database,
+    config: Config,
+    state: FSMContext,
+) -> None:
+    await state.clear()
+    if message.from_user is None:
+        return
+    user = await _ensure_user(message.from_user, db, config)
+    transactions, has_active = await _wallet_payload(db, user)
+    await send_themed_text(
+        lambda rendered, keyboard: message.answer(rendered, reply_markup=keyboard),
+        lambda custom: wallet_text(
+            user,
+            recent_transactions=transactions,
+            use_custom_emoji=custom,
+        ),
+        lambda custom: wallet_keyboard(
+            user.locale.value,
+            config,
+            custom,
+            has_active_deposit=has_active,
+        ),
+    )
+
+
 @router.message(Command("support", "paysupport"))
 async def support(message: Message, db: Database, config: Config, state: FSMContext) -> None:
     await state.clear()
@@ -553,6 +658,388 @@ async def unavailable(callback: CallbackQuery, db: Database, config: Config) -> 
 @router.callback_query(F.data == "purchase_quantity_noop")
 async def purchase_quantity_noop(callback: CallbackQuery) -> None:
     await callback.answer()
+
+
+@router.callback_query(WalletCallback.filter())
+async def wallet_action(
+    callback: CallbackQuery,
+    callback_data: WalletCallback,
+    db: Database,
+    config: Config,
+    state: FSMContext,
+) -> None:
+    message = _message_from_callback(callback)
+    user = await _ensure_user(callback.from_user, db, config)
+    locale = user.locale.value
+    if message is None:
+        await callback.answer()
+        return
+
+    if callback_data.action == "top_up":
+        if not _binance_id_configured(config):
+            await callback.answer(
+                "Binance ID is not configured. Contact support."
+                if locale == "en"
+                else "Binance ID не настроен. Обратитесь в поддержку.",
+                show_alert=True,
+            )
+            return
+        await db.cleanup_expired_balance_deposits()
+        active = await db.get_active_balance_deposit(user.telegram_id)
+        if active is not None:
+            await state.clear()
+            await callback.answer(
+                t(
+                    "wallet.deposit.pending_exists",
+                    locale,
+                    deposit_id=active.id,
+                    escape_html=False,
+                ),
+                show_alert=True,
+            )
+            await edit_shop_screen(
+                message,
+                lambda custom: balance_deposit_text(
+                    active,
+                    locale,
+                    binance_id=config.binance_id,
+                    balance_usdt_micros=user.balance_usdt_micros,
+                    use_custom_emoji=custom,
+                ),
+                lambda custom: balance_deposit_keyboard(
+                    active.id,
+                    locale,
+                    config,
+                    custom,
+                    submitted=active.status is not BalanceDepositStatus.AWAITING_PAYMENT,
+                ),
+            )
+            return
+        await state.set_state(WalletDepositState.amount)
+        await callback.answer()
+        await message.answer(
+            t(
+                "wallet.deposit.amount_prompt",
+                locale,
+                minimum=format_usdt(MIN_WALLET_DEPOSIT_USDT_MICROS),
+            )
+        )
+        return
+
+    if callback_data.action == "active_deposit":
+        await state.clear()
+        await db.cleanup_expired_balance_deposits()
+        active = await db.get_active_balance_deposit(user.telegram_id)
+        if active is None:
+            await callback.answer(
+                t("wallet.deposit.not_found", locale, escape_html=False),
+                show_alert=True,
+            )
+            return
+        await callback.answer()
+        await edit_shop_screen(
+            message,
+            lambda custom: balance_deposit_text(
+                active,
+                locale,
+                binance_id=config.binance_id,
+                balance_usdt_micros=user.balance_usdt_micros,
+                use_custom_emoji=custom,
+            ),
+            lambda custom: balance_deposit_keyboard(
+                active.id,
+                locale,
+                config,
+                custom,
+                submitted=active.status is not BalanceDepositStatus.AWAITING_PAYMENT,
+            ),
+        )
+        return
+
+    if callback_data.action != "open":
+        await callback.answer(t("error.invalid_action", locale), show_alert=True)
+        return
+    await state.clear()
+    user = await _ensure_user(callback.from_user, db, config)
+    transactions, has_active = await _wallet_payload(db, user)
+    await callback.answer()
+    await edit_shop_screen(
+        message,
+        lambda custom: wallet_text(
+            user,
+            recent_transactions=transactions,
+            use_custom_emoji=custom,
+        ),
+        lambda custom: wallet_keyboard(
+            locale,
+            config,
+            custom,
+            has_active_deposit=has_active,
+        ),
+    )
+
+
+@router.message(WalletDepositState.amount)
+async def receive_wallet_deposit_amount(
+    message: Message,
+    db: Database,
+    config: Config,
+    state: FSMContext,
+) -> None:
+    if message.from_user is None:
+        return
+    user = await _ensure_user(message.from_user, db, config)
+    locale = user.locale.value
+    amount = _parse_wallet_amount(message.text or "")
+    if amount is None:
+        await message.answer(t("wallet.deposit.amount_invalid", locale))
+        return
+    if not _binance_id_configured(config):
+        await state.clear()
+        await message.answer(
+            "Binance ID is not configured. Contact support."
+            if locale == "en"
+            else "Binance ID не настроен. Обратитесь в поддержку."
+        )
+        return
+    try:
+        deposit = await db.create_balance_deposit(
+            user.telegram_id,
+            amount,
+            reservation_ttl=timedelta(minutes=config.order_reservation_minutes),
+        )
+    except PendingBalanceDepositExists as exc:
+        deposit = await db.get_balance_deposit(exc.deposit_id, user_id=user.telegram_id)
+        if deposit is None:
+            await message.answer(t("wallet.deposit.not_found", locale))
+            return
+        await message.answer(
+            t("wallet.deposit.pending_exists", locale, deposit_id=deposit.id)
+        )
+    except (ValueError, ShopDatabaseError):
+        logger.exception("Could not create wallet deposit for user %s", user.telegram_id)
+        await message.answer(t("error.generic", locale))
+        return
+    await state.clear()
+    await send_themed_text(
+        lambda rendered, keyboard: message.answer(rendered, reply_markup=keyboard),
+        lambda custom: balance_deposit_text(
+            deposit,
+            locale,
+            binance_id=config.binance_id,
+            balance_usdt_micros=user.balance_usdt_micros,
+            use_custom_emoji=custom,
+        ),
+        lambda custom: balance_deposit_keyboard(
+            deposit.id,
+            locale,
+            config,
+            custom,
+            submitted=deposit.status is not BalanceDepositStatus.AWAITING_PAYMENT,
+        ),
+    )
+
+
+@router.callback_query(BalanceDepositCallback.filter(F.action == "sent"))
+async def acknowledge_wallet_deposit(
+    callback: CallbackQuery,
+    callback_data: BalanceDepositCallback,
+    bot: Bot,
+    db: Database,
+    config: Config,
+    state: FSMContext,
+) -> None:
+    user = await _ensure_user(callback.from_user, db, config)
+    locale = user.locale.value
+    before = await db.get_balance_deposit(
+        callback_data.deposit_id,
+        user_id=user.telegram_id,
+    )
+    if before is None:
+        await callback.answer(
+            t("wallet.deposit.not_found", locale, escape_html=False),
+            show_alert=True,
+        )
+        return
+    try:
+        deposit = await db.acknowledge_balance_deposit(
+            before.id,
+            user.telegram_id,
+        )
+    except ReservationExpired:
+        await state.clear()
+        await callback.answer(
+            t(
+                "wallet.deposit.expired",
+                locale,
+                deposit_id=before.id,
+                escape_html=False,
+            ),
+            show_alert=True,
+        )
+        return
+    except ShopDatabaseError:
+        await callback.answer(
+            t("wallet.deposit.not_found", locale, escape_html=False),
+            show_alert=True,
+        )
+        return
+    if before.payment_claimed_at is None:
+        await _notify_admins_about_balance_deposit(bot, db, config, deposit.id)
+    if deposit.binance_transfer_id:
+        await state.clear()
+        await callback.answer()
+        return
+    await state.set_state(WalletDepositState.transfer_id)
+    await state.update_data(deposit_id=deposit.id)
+    await callback.answer()
+    if isinstance(callback.message, Message):
+        await callback.message.answer(t("wallet.deposit.transfer_prompt", locale))
+
+
+@router.message(WalletDepositState.transfer_id)
+async def receive_wallet_deposit_transfer_id(
+    message: Message,
+    bot: Bot,
+    db: Database,
+    config: Config,
+    state: FSMContext,
+) -> None:
+    if message.from_user is None:
+        return
+    user = await _ensure_user(message.from_user, db, config)
+    locale = user.locale.value
+    data = await state.get_data()
+    deposit_id = data.get("deposit_id")
+    if not isinstance(deposit_id, int):
+        await state.clear()
+        await message.answer(t("wallet.deposit.not_found", locale))
+        return
+    try:
+        deposit = await db.submit_balance_deposit_transfer(
+            deposit_id,
+            user.telegram_id,
+            message.text or "",
+        )
+    except ReservationExpired:
+        await state.clear()
+        await message.answer(
+            t("wallet.deposit.expired", locale, deposit_id=deposit_id)
+        )
+        return
+    except (ValueError, ShopDatabaseError):
+        await message.answer(t("wallet.deposit.transfer_invalid", locale))
+        return
+    await state.clear()
+    refreshed_user = await db.get_user(user.telegram_id) or user
+    await send_themed_text(
+        lambda rendered, keyboard: message.answer(rendered, reply_markup=keyboard),
+        lambda custom: balance_deposit_text(
+            deposit,
+            locale,
+            binance_id=config.binance_id,
+            balance_usdt_micros=refreshed_user.balance_usdt_micros,
+            use_custom_emoji=custom,
+        ),
+        lambda custom: balance_deposit_keyboard(
+            deposit.id,
+            locale,
+            config,
+            custom,
+            submitted=True,
+        ),
+    )
+    await _notify_admins_about_balance_deposit(bot, db, config, deposit.id)
+
+
+@router.callback_query(BalancePayCallback.filter())
+async def pay_with_wallet_balance(
+    callback: CallbackQuery,
+    callback_data: BalancePayCallback,
+    bot: Bot,
+    db: Database,
+    config: Config,
+    state: FSMContext,
+) -> None:
+    message = _message_from_callback(callback)
+    user = await _ensure_user(callback.from_user, db, config)
+    locale = user.locale.value
+    previous_balance_payment = await db.get_order_balance_payment(
+        callback_data.order_id
+    )
+    try:
+        order = await db.pay_order_from_balance(
+            callback_data.order_id,
+            user.telegram_id,
+        )
+    except InsufficientBalance as exc:
+        await callback.answer(
+            t(
+                "wallet.insufficient_balance",
+                locale,
+                balance=format_usdt(exc.available),
+                required=format_usdt(exc.required),
+                currency="USDT",
+                escape_html=False,
+            ),
+            show_alert=True,
+        )
+        return
+    except ReservationExpired:
+        await state.clear()
+        await callback.answer(
+            t("order.reservation_expired", locale, escape_html=False),
+            show_alert=True,
+        )
+        return
+    except ShopDatabaseError:
+        await callback.answer(t("order.not_found", locale), show_alert=True)
+        return
+    await state.clear()
+    refreshed_user = await db.get_user(user.telegram_id) or user
+    amount = order.manual_amount_usdt_micros or 0
+    await callback.answer(
+        t(
+            "wallet.paid",
+            locale,
+            order_id=order.id,
+            amount=format_usdt(amount),
+            balance=format_usdt(refreshed_user.balance_usdt_micros),
+            currency="USDT",
+            escape_html=False,
+        ),
+        show_alert=True,
+    )
+    product = await db.get_product(order.product_id)
+    if message is not None:
+        await edit_shop_screen(
+            message,
+            lambda custom: payment_success_text(
+                locale,
+                order_id=order.id,
+                total=format_usdt(amount),
+                currency="USDT",
+                use_custom_emoji=custom,
+            ),
+            lambda custom: order_keyboard(order, locale, config, custom),
+        )
+    if previous_balance_payment is not None:
+        return
+    admin_text = (
+        f"<b>💰 Заказ #{order.id} оплачен с баланса</b>\n\n"
+        f"Покупатель: <code>{order.user_id}</code>\n"
+        f"Товар: {escape(product.name('ru')) if product else 'не найден'}\n"
+        f"Количество: <b>{order.quantity}</b>\n"
+        f"Сумма: <code>{format_usdt(amount)} USDT</code>\n\n"
+        "Оплата уже списана с внутреннего баланса. Можно отправлять аккаунты."
+    )
+    for admin_id in config.admin_ids:
+        with contextlib.suppress(TelegramAPIError):
+            await bot.send_message(
+                admin_id,
+                admin_text,
+                reply_markup=admin_payment_keyboard(order.id, confirmed=True),
+            )
 
 
 @router.callback_query(NavigationCallback.filter())

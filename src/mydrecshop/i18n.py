@@ -45,6 +45,7 @@ type TextKey = Literal[
     "home.profile",
     "home.language",
     "home.support",
+    "home.wallet",
     "catalog.message",
     "catalog.empty",
     "catalog.product_line",
@@ -67,6 +68,33 @@ type TextKey = Literal[
     "language.already_selected",
     "profile.message",
     "profile.open_orders",
+    "wallet.message",
+    "wallet.no_transactions",
+    "wallet.transaction_line",
+    "wallet.transaction.admin_credit",
+    "wallet.transaction.admin_debit",
+    "wallet.transaction.binance_deposit",
+    "wallet.transaction.order_payment",
+    "wallet.transaction.order_refund",
+    "wallet.top_up",
+    "wallet.open_deposit",
+    "wallet.back",
+    "wallet.deposit.amount_prompt",
+    "wallet.deposit.amount_invalid",
+    "wallet.deposit.pending_exists",
+    "wallet.deposit.details",
+    "wallet.deposit.review",
+    "wallet.deposit.sent",
+    "wallet.deposit.transfer_prompt",
+    "wallet.deposit.transfer_invalid",
+    "wallet.deposit.confirmed",
+    "wallet.deposit.rejected",
+    "wallet.deposit.expired",
+    "wallet.deposit.not_found",
+    "wallet.pay_from_balance",
+    "wallet.insufficient_balance",
+    "wallet.paid",
+    "wallet.refunded",
     "orders.message",
     "orders.empty",
     "orders.row",
@@ -199,6 +227,7 @@ _RU: dict[str, str] = {
     "home.profile": "👤 Профиль",
     "home.language": "🌍 Сменить язык",
     "home.support": "💬 Поддержка",
+    "home.wallet": "💰 Кошелёк",
     "catalog.message": "<b>{catalog_icon} Каталог товаров</b>\n\nВыберите товар:",
     "catalog.empty": (
         "<b>{catalog_icon} Каталог товаров</b>\n\nПока в каталоге нет доступных товаров."
@@ -254,10 +283,81 @@ _RU: dict[str, str] = {
         "<b>{identifier_icon} ID:</b> <code>{user_id}</code>\n"
         "<b>{language_icon} Язык:</b> {language}\n"
         "<b>{orders_icon} Заказов:</b> {orders_count} {orders_word}\n"
+        "<b>{balance_icon} Баланс:</b> {balance} {currency}\n"
         "<b>{payment_icon} Потрачено:</b> {spent} {currency}\n"
         "<b>{calendar_icon} С нами с:</b> {registered_at}"
     ),
     "profile.open_orders": "📦 Мои заказы",
+    "wallet.message": (
+        "<b>{wallet_icon} Кошелёк</b>\n\n"
+        "<b>{balance_icon} Баланс:</b> {balance} {currency}\n\n"
+        "<b>Последние операции:</b>\n{history}"
+    ),
+    "wallet.no_transactions": "Операций пока нет.",
+    "wallet.transaction_line": "• {amount} {currency} — {kind}\n  <i>{created_at}</i>",
+    "wallet.transaction.admin_credit": "пополнение администратором",
+    "wallet.transaction.admin_debit": "списание администратором",
+    "wallet.transaction.binance_deposit": "пополнение через Binance Pay",
+    "wallet.transaction.order_payment": "оплата заказа",
+    "wallet.transaction.order_refund": "возврат за заказ",
+    "wallet.top_up": "➕ Пополнить кошелёк",
+    "wallet.open_deposit": "💳 Открыть текущее пополнение",
+    "wallet.back": "⬅️ В кошелёк",
+    "wallet.deposit.amount_prompt": (
+        "Введите сумму пополнения в USDT, например <code>10</code> или "
+        "<code>12.5</code>. Минимальная сумма — {minimum} USDT."
+    ),
+    "wallet.deposit.amount_invalid": (
+        "Введите корректную положительную сумму в USDT — не более 6 знаков после запятой."
+    ),
+    "wallet.deposit.pending_exists": (
+        "У вас уже есть активная заявка на пополнение №{deposit_id}. "
+        "Завершите её перед созданием новой."
+    ),
+    "wallet.deposit.details": (
+        "<b>{payment_icon} Пополнение баланса №{deposit_id}</b>\n\n"
+        "<b>Сумма:</b> {amount} {currency}\n"
+        "<b>Binance ID:</b> <code>{binance_id}</code>\n"
+        "<b>Note:</b> <code>{payment_note}</code>\n"
+        "<b>Оплатить до:</b> {expires_at}\n\n"
+        "Переведите точную сумму на Binance ID и обязательно укажите Note. "
+        "После перевода нажмите «Я отправил»."
+    ),
+    "wallet.deposit.review": (
+        "<b>{pending_icon} Пополнение №{deposit_id} на проверке</b>\n\n"
+        "<b>Сумма:</b> {amount} {currency}\n"
+        "<b>ID перевода:</b> <code>{transfer_id}</code>\n\n"
+        "Администратор проверит перевод и вручную зачислит средства."
+    ),
+    "wallet.deposit.sent": "✅ Я отправил",
+    "wallet.deposit.transfer_prompt": (
+        "Отправьте ID перевода Binance Pay одним сообщением. "
+        "После этого заявка уйдёт администратору."
+    ),
+    "wallet.deposit.transfer_invalid": "Введите корректный ID перевода Binance Pay.",
+    "wallet.deposit.confirmed": (
+        "✅ Пополнение №{deposit_id} подтверждено. На баланс зачислено {amount} {currency}. "
+        "Текущий баланс: {balance} {currency}."
+    ),
+    "wallet.deposit.rejected": (
+        "❌ Пополнение №{deposit_id} отклонено администратором. Средства на баланс не зачислены."
+    ),
+    "wallet.deposit.expired": (
+        "Время оплаты пополнения №{deposit_id} истекло. Создайте новую заявку в кошельке."
+    ),
+    "wallet.deposit.not_found": "Заявка на пополнение не найдена или уже недоступна.",
+    "wallet.pay_from_balance": "💰 Оплатить с баланса",
+    "wallet.insufficient_balance": (
+        "Недостаточно средств. На балансе: {balance} {currency}, требуется: {required} {currency}."
+    ),
+    "wallet.paid": (
+        "✅ Заказ №{order_id} оплачен с баланса: {amount} {currency}. "
+        "Остаток: {balance} {currency}."
+    ),
+    "wallet.refunded": (
+        "↩️ Возврат за заказ №{order_id}: {amount} {currency} зачислено на баланс. "
+        "Текущий баланс: {balance} {currency}."
+    ),
     "orders.message": "<b>{orders_icon} Мои заказы</b>\n\nВыберите заказ:",
     "orders.empty": (
         "<b>{orders_icon} Мои заказы</b>\n\n"
@@ -442,6 +542,7 @@ _EN: dict[str, str] = {
     "home.profile": "👤 Profile",
     "home.language": "🌍 Change language",
     "home.support": "💬 Support",
+    "home.wallet": "💰 Wallet",
     "catalog.message": "<b>{catalog_icon} Product catalog</b>\n\nChoose a product:",
     "catalog.empty": (
         "<b>{catalog_icon} Product catalog</b>\n\n"
@@ -498,10 +599,82 @@ _EN: dict[str, str] = {
         "<b>{identifier_icon} ID:</b> <code>{user_id}</code>\n"
         "<b>{language_icon} Language:</b> {language}\n"
         "<b>{orders_icon} Orders:</b> {orders_count} {orders_word}\n"
+        "<b>{balance_icon} Balance:</b> {balance} {currency}\n"
         "<b>{payment_icon} Spent:</b> {spent} {currency}\n"
         "<b>{calendar_icon} Member since:</b> {registered_at}"
     ),
     "profile.open_orders": "📦 My orders",
+    "wallet.message": (
+        "<b>{wallet_icon} Wallet</b>\n\n"
+        "<b>{balance_icon} Balance:</b> {balance} {currency}\n\n"
+        "<b>Recent transactions:</b>\n{history}"
+    ),
+    "wallet.no_transactions": "No transactions yet.",
+    "wallet.transaction_line": "• {amount} {currency} — {kind}\n  <i>{created_at}</i>",
+    "wallet.transaction.admin_credit": "administrator credit",
+    "wallet.transaction.admin_debit": "administrator debit",
+    "wallet.transaction.binance_deposit": "Binance Pay deposit",
+    "wallet.transaction.order_payment": "order payment",
+    "wallet.transaction.order_refund": "order refund",
+    "wallet.top_up": "➕ Top up wallet",
+    "wallet.open_deposit": "💳 Open current top-up",
+    "wallet.back": "⬅️ Back to wallet",
+    "wallet.deposit.amount_prompt": (
+        "Enter a USDT top-up amount, for example <code>10</code> or "
+        "<code>12.5</code>. The minimum is {minimum} USDT."
+    ),
+    "wallet.deposit.amount_invalid": (
+        "Enter a valid positive USDT amount with no more than 6 decimal places."
+    ),
+    "wallet.deposit.pending_exists": (
+        "You already have active top-up request #{deposit_id}. "
+        "Complete it before creating another one."
+    ),
+    "wallet.deposit.details": (
+        "<b>{payment_icon} Wallet top-up #{deposit_id}</b>\n\n"
+        "<b>Amount:</b> {amount} {currency}\n"
+        "<b>Binance ID:</b> <code>{binance_id}</code>\n"
+        "<b>Note:</b> <code>{payment_note}</code>\n"
+        "<b>Pay by:</b> {expires_at}\n\n"
+        "Send the exact amount to the Binance ID and include the Note. "
+        "After sending, tap “I sent it”."
+    ),
+    "wallet.deposit.review": (
+        "<b>{pending_icon} Top-up #{deposit_id} is under review</b>\n\n"
+        "<b>Amount:</b> {amount} {currency}\n"
+        "<b>Transfer ID:</b> <code>{transfer_id}</code>\n\n"
+        "The administrator will verify the transfer and credit your balance manually."
+    ),
+    "wallet.deposit.sent": "✅ I sent it",
+    "wallet.deposit.transfer_prompt": (
+        "Send the Binance Pay transfer ID in one message. "
+        "The request will then be sent to the administrator."
+    ),
+    "wallet.deposit.transfer_invalid": "Enter a valid Binance Pay transfer ID.",
+    "wallet.deposit.confirmed": (
+        "✅ Top-up #{deposit_id} confirmed. {amount} {currency} was credited. "
+        "Current balance: {balance} {currency}."
+    ),
+    "wallet.deposit.rejected": (
+        "❌ Top-up #{deposit_id} was rejected by the administrator. Your balance was not credited."
+    ),
+    "wallet.deposit.expired": (
+        "The payment window for top-up #{deposit_id} has expired. "
+        "Create a new request in your wallet."
+    ),
+    "wallet.deposit.not_found": "The top-up request was not found or is no longer available.",
+    "wallet.pay_from_balance": "💰 Pay from balance",
+    "wallet.insufficient_balance": (
+        "Insufficient balance. Available: {balance} {currency}; required: {required} {currency}."
+    ),
+    "wallet.paid": (
+        "✅ Order #{order_id} was paid from your balance: {amount} {currency}. "
+        "Remaining balance: {balance} {currency}."
+    ),
+    "wallet.refunded": (
+        "↩️ Refund for order #{order_id}: {amount} {currency} was returned to your balance. "
+        "Current balance: {balance} {currency}."
+    ),
     "orders.message": "<b>{orders_icon} My orders</b>\n\nChoose an order:",
     "orders.empty": (
         "<b>{orders_icon} My orders</b>\n\n"

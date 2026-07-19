@@ -58,6 +58,24 @@ class OpenBinanceCallback(CallbackData, prefix="bopen"):
     order_id: int
 
 
+class BalancePayCallback(CallbackData, prefix="balpay"):
+    order_id: int
+
+
+class WalletCallback(CallbackData, prefix="wallet"):
+    action: str
+
+
+class BalanceDepositCallback(CallbackData, prefix="bdep"):
+    action: str
+    deposit_id: int
+
+
+class AdminBalanceDepositCallback(CallbackData, prefix="abdep"):
+    action: str
+    deposit_id: int
+
+
 class ConfirmBinanceCallback(CallbackData, prefix="bcfm"):
     order_id: int
 

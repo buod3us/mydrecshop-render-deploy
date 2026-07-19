@@ -15,6 +15,10 @@ from typing import Any
 import aiosqlite
 
 from .models import (
+    BalanceDeposit,
+    BalanceDepositStatus,
+    BalanceTransaction,
+    BalanceTransactionKind,
     InventoryItem,
     Locale,
     Order,
@@ -32,7 +36,7 @@ APPROVED_CHECKOUT_TTL = timedelta(minutes=30)
 MAX_CLEANUP_BATCH = 500
 MAX_ORDER_QUANTITY = 1_000
 MAX_SQLITE_INTEGER = 2**63 - 1
-CURRENT_SCHEMA_VERSION = 8
+CURRENT_SCHEMA_VERSION = 9
 
 
 class ShopDatabaseError(RuntimeError):
@@ -53,6 +57,33 @@ class SalesDisabled(ShopDatabaseError):
 
 class MaintenanceEnabled(ShopDatabaseError):
     pass
+
+
+class UserNotFound(ShopDatabaseError):
+    pass
+
+
+class InsufficientBalance(ShopDatabaseError):
+    def __init__(self, *, required: int, available: int) -> None:
+        self.required = required
+        self.available = available
+        super().__init__(
+            f"required {required} USDT micros, but only {available} are available"
+        )
+
+
+class BalanceConflict(ShopDatabaseError):
+    pass
+
+
+class BalanceDepositNotFound(ShopDatabaseError):
+    pass
+
+
+class PendingBalanceDepositExists(ShopDatabaseError):
+    def __init__(self, deposit_id: int) -> None:
+        self.deposit_id = deposit_id
+        super().__init__(f"user already has active balance deposit {deposit_id}")
 
 
 class ProductPriceChanged(ShopDatabaseError):
@@ -128,6 +159,7 @@ _SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
     telegram_id INTEGER PRIMARY KEY,
     locale TEXT NOT NULL DEFAULT 'ru' CHECK (locale IN ('ru', 'en')),
+    balance_usdt_micros INTEGER NOT NULL DEFAULT 0 CHECK (balance_usdt_micros >= 0),
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -245,6 +277,69 @@ CREATE TABLE IF NOT EXISTS terms_acceptances (
     accepted_at TEXT NOT NULL,
     PRIMARY KEY (user_id, version)
 );
+
+CREATE TABLE IF NOT EXISTS balance_deposits (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users(telegram_id) ON DELETE RESTRICT,
+    amount_usdt_micros INTEGER NOT NULL CHECK (amount_usdt_micros > 0),
+    payment_note TEXT NOT NULL UNIQUE,
+    binance_transfer_id TEXT UNIQUE,
+    status TEXT NOT NULL CHECK (status IN (
+        'awaiting_payment', 'awaiting_review', 'confirmed', 'rejected', 'expired'
+    )),
+    reservation_expires_at TEXT,
+    payment_claimed_at TEXT,
+    confirmed_at TEXT,
+    rejected_at TEXT,
+    expired_at TEXT,
+    reviewed_by INTEGER,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_balance_deposits_one_active_per_user
+    ON balance_deposits(user_id)
+    WHERE status IN ('awaiting_payment', 'awaiting_review');
+CREATE INDEX IF NOT EXISTS idx_balance_deposits_status_created
+    ON balance_deposits(status, created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_balance_deposits_expiry
+    ON balance_deposits(reservation_expires_at)
+    WHERE status = 'awaiting_payment';
+
+CREATE TABLE IF NOT EXISTS binance_transfer_claims (
+    normalized_transfer_id TEXT PRIMARY KEY,
+    display_transfer_id TEXT NOT NULL,
+    order_id INTEGER UNIQUE REFERENCES orders(id) ON DELETE RESTRICT,
+    deposit_id INTEGER UNIQUE REFERENCES balance_deposits(id) ON DELETE RESTRICT,
+    created_at TEXT NOT NULL,
+    CHECK ((order_id IS NOT NULL) <> (deposit_id IS NOT NULL))
+);
+
+CREATE TABLE IF NOT EXISTS balance_transactions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users(telegram_id) ON DELETE RESTRICT,
+    delta_usdt_micros INTEGER NOT NULL CHECK (delta_usdt_micros <> 0),
+    balance_after_usdt_micros INTEGER NOT NULL CHECK (balance_after_usdt_micros >= 0),
+    kind TEXT NOT NULL CHECK (kind IN (
+        'admin_credit', 'admin_debit', 'binance_deposit',
+        'order_payment', 'order_refund'
+    )),
+    order_id INTEGER REFERENCES orders(id) ON DELETE RESTRICT,
+    deposit_id INTEGER REFERENCES balance_deposits(id) ON DELETE RESTRICT,
+    admin_id INTEGER,
+    note TEXT NOT NULL DEFAULT '',
+    idempotency_key TEXT UNIQUE,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_balance_transactions_user_created
+    ON balance_transactions(user_id, created_at DESC, id DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_balance_transactions_order_kind
+    ON balance_transactions(order_id, kind)
+    WHERE order_id IS NOT NULL AND kind IN ('order_payment', 'order_refund');
+CREATE UNIQUE INDEX IF NOT EXISTS idx_balance_transactions_deposit
+    ON balance_transactions(deposit_id)
+    WHERE deposit_id IS NOT NULL AND kind = 'binance_deposit';
 """
 
 
@@ -273,6 +368,52 @@ def _user_from_row(row: sqlite3.Row) -> User:
     return User(
         telegram_id=int(row["telegram_id"]),
         locale=Locale(row["locale"]),
+        created_at=_from_db_datetime(row["created_at"]),  # type: ignore[arg-type]
+        updated_at=_from_db_datetime(row["updated_at"]),  # type: ignore[arg-type]
+        balance_usdt_micros=int(row["balance_usdt_micros"]),
+    )
+
+
+def _balance_transaction_from_row(row: sqlite3.Row) -> BalanceTransaction:
+    return BalanceTransaction(
+        id=int(row["id"]),
+        user_id=int(row["user_id"]),
+        delta_usdt_micros=int(row["delta_usdt_micros"]),
+        balance_after_usdt_micros=int(row["balance_after_usdt_micros"]),
+        kind=BalanceTransactionKind(row["kind"]),
+        order_id=int(row["order_id"]) if row["order_id"] is not None else None,
+        deposit_id=(
+            int(row["deposit_id"]) if row["deposit_id"] is not None else None
+        ),
+        admin_id=int(row["admin_id"]) if row["admin_id"] is not None else None,
+        note=str(row["note"]),
+        idempotency_key=(
+            str(row["idempotency_key"])
+            if row["idempotency_key"] is not None
+            else None
+        ),
+        created_at=_from_db_datetime(row["created_at"]),  # type: ignore[arg-type]
+    )
+
+
+def _balance_deposit_from_row(row: sqlite3.Row) -> BalanceDeposit:
+    return BalanceDeposit(
+        id=int(row["id"]),
+        user_id=int(row["user_id"]),
+        amount_usdt_micros=int(row["amount_usdt_micros"]),
+        payment_note=str(row["payment_note"]),
+        binance_transfer_id=(
+            str(row["binance_transfer_id"])
+            if row["binance_transfer_id"] is not None
+            else None
+        ),
+        status=BalanceDepositStatus(row["status"]),
+        reservation_expires_at=_from_db_datetime(row["reservation_expires_at"]),
+        payment_claimed_at=_from_db_datetime(row["payment_claimed_at"]),
+        confirmed_at=_from_db_datetime(row["confirmed_at"]),
+        rejected_at=_from_db_datetime(row["rejected_at"]),
+        expired_at=_from_db_datetime(row["expired_at"]),
+        reviewed_by=int(row["reviewed_by"]) if row["reviewed_by"] is not None else None,
         created_at=_from_db_datetime(row["created_at"]),  # type: ignore[arg-type]
         updated_at=_from_db_datetime(row["updated_at"]),  # type: ignore[arg-type]
     )
@@ -472,6 +613,15 @@ class Database:
                 """,
                 (_to_db_datetime(_utc_now()),),
             )
+            user_columns = {
+                str(row["name"])
+                for row in await _fetchall(connection, "PRAGMA table_info(users)")
+            }
+            if "balance_usdt_micros" not in user_columns:
+                await connection.execute(
+                    "ALTER TABLE users ADD COLUMN balance_usdt_micros "
+                    "INTEGER NOT NULL DEFAULT 0 CHECK (balance_usdt_micros >= 0)"
+                )
             product_columns = {
                 str(row["name"])
                 for row in await _fetchall(connection, "PRAGMA table_info(products)")
@@ -502,6 +652,66 @@ class Database:
             if "inventory_claimed_at" not in columns:
                 await connection.execute(
                     "ALTER TABLE orders ADD COLUMN inventory_claimed_at TEXT"
+                )
+            await connection.execute(
+                """
+                INSERT OR IGNORE INTO binance_transfer_claims(
+                    normalized_transfer_id, display_transfer_id,
+                    order_id, deposit_id, created_at
+                )
+                SELECT lower(trim(binance_transfer_id)), binance_transfer_id,
+                       id, NULL, COALESCE(updated_at, created_at)
+                FROM orders
+                WHERE binance_transfer_id IS NOT NULL
+                """
+            )
+            await connection.execute(
+                """
+                INSERT OR IGNORE INTO binance_transfer_claims(
+                    normalized_transfer_id, display_transfer_id,
+                    order_id, deposit_id, created_at
+                )
+                SELECT lower(trim(binance_transfer_id)), binance_transfer_id,
+                       NULL, id, COALESCE(updated_at, created_at)
+                FROM balance_deposits
+                WHERE binance_transfer_id IS NOT NULL
+                """
+            )
+            conflicting_order_claim = await _fetchone(
+                connection,
+                """
+                SELECT orders.id, orders.binance_transfer_id
+                FROM orders
+                LEFT JOIN binance_transfer_claims AS claims
+                  ON claims.normalized_transfer_id = lower(trim(orders.binance_transfer_id))
+                WHERE orders.binance_transfer_id IS NOT NULL
+                  AND (claims.order_id IS NOT orders.id OR claims.deposit_id IS NOT NULL)
+                LIMIT 1
+                """,
+            )
+            if conflicting_order_claim is not None:
+                raise PaymentConflict(
+                    "an existing order transfer ID conflicts with another payment"
+                )
+            conflicting_deposit_claim = await _fetchone(
+                connection,
+                """
+                SELECT balance_deposits.id, balance_deposits.binance_transfer_id
+                FROM balance_deposits
+                LEFT JOIN binance_transfer_claims AS claims
+                  ON claims.normalized_transfer_id =
+                     lower(trim(balance_deposits.binance_transfer_id))
+                WHERE balance_deposits.binance_transfer_id IS NOT NULL
+                  AND (
+                    claims.deposit_id IS NOT balance_deposits.id
+                    OR claims.order_id IS NOT NULL
+                  )
+                LIMIT 1
+                """,
+            )
+            if conflicting_deposit_claim is not None:
+                raise PaymentConflict(
+                    "an existing deposit transfer ID conflicts with another payment"
                 )
             if previous_version and previous_version < 4:
                 now = _to_db_datetime(_utc_now())
@@ -534,6 +744,9 @@ class Database:
                     ON orders(binance_transfer_id) WHERE binance_transfer_id IS NOT NULL;
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_binance_transfer_nocase
                     ON orders(lower(binance_transfer_id))
+                    WHERE binance_transfer_id IS NOT NULL;
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_balance_deposits_transfer_nocase
+                    ON balance_deposits(lower(binance_transfer_id))
                     WHERE binance_transfer_id IS NOT NULL;
                 CREATE INDEX IF NOT EXISTS idx_orders_product_status
                     ON orders(product_id, status, reservation_expires_at);
@@ -806,6 +1019,529 @@ class Database:
                 (limit, offset),
             )
         return [_user_from_row(row) for row in rows]
+
+    async def get_user_balance(self, user_id: int) -> int:
+        """Return a registered customer's balance in integer USDT micros."""
+
+        async with self._lock:
+            row = await _fetchone(
+                self._require_connection(),
+                "SELECT balance_usdt_micros FROM users WHERE telegram_id = ?",
+                (user_id,),
+            )
+        if row is None:
+            raise UserNotFound(f"user {user_id} is not registered")
+        return int(row["balance_usdt_micros"])
+
+    async def adjust_user_balance(
+        self,
+        user_id: int,
+        delta_usdt_micros: int,
+        *,
+        admin_id: int,
+        note: str = "",
+        idempotency_key: str | None = None,
+    ) -> BalanceTransaction:
+        """Apply one audited administrator credit or debit atomically."""
+
+        if user_id <= 0 or admin_id <= 0:
+            raise ValueError("user_id and admin_id must be positive")
+        if delta_usdt_micros == 0 or abs(delta_usdt_micros) > MAX_SQLITE_INTEGER:
+            raise ValueError("balance delta is outside the supported range")
+        normalized_note = note.strip()
+        if len(normalized_note) > 500:
+            raise ValueError("balance note cannot exceed 500 characters")
+        normalized_key = idempotency_key.strip() if idempotency_key is not None else None
+        if normalized_key is not None and not 1 <= len(normalized_key) <= 128:
+            raise ValueError("idempotency key must contain 1 to 128 characters")
+        kind = (
+            BalanceTransactionKind.ADMIN_CREDIT
+            if delta_usdt_micros > 0
+            else BalanceTransactionKind.ADMIN_DEBIT
+        )
+        async with self._lock:
+            connection = self._require_connection()
+            async with self._transaction(connection):
+                current_db = _to_db_datetime(_utc_now())
+                return await self._insert_balance_transaction_in_transaction(
+                    connection,
+                    user_id=user_id,
+                    delta_usdt_micros=delta_usdt_micros,
+                    kind=kind,
+                    current_db=current_db,
+                    admin_id=admin_id,
+                    note=normalized_note,
+                    idempotency_key=normalized_key,
+                )
+
+    async def list_balance_transactions(
+        self,
+        user_id: int,
+        *,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> list[BalanceTransaction]:
+        _validate_page(limit, offset)
+        async with self._lock:
+            rows = await _fetchall(
+                self._require_connection(),
+                """
+                SELECT * FROM balance_transactions
+                WHERE user_id = ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT ? OFFSET ?
+                """,
+                (user_id, limit, offset),
+            )
+        return [_balance_transaction_from_row(row) for row in rows]
+
+    async def get_order_balance_payment(
+        self,
+        order_id: int,
+    ) -> BalanceTransaction | None:
+        async with self._lock:
+            row = await _fetchone(
+                self._require_connection(),
+                """
+                SELECT * FROM balance_transactions
+                WHERE order_id = ? AND kind = ?
+                """,
+                (order_id, BalanceTransactionKind.ORDER_PAYMENT.value),
+            )
+        return _balance_transaction_from_row(row) if row is not None else None
+
+    async def create_balance_deposit(
+        self,
+        user_id: int,
+        amount_usdt_micros: int,
+        *,
+        reservation_ttl: timedelta = DEFAULT_RESERVATION_TTL,
+        now: datetime | None = None,
+    ) -> BalanceDeposit:
+        """Create one timed Binance wallet-deposit request for a registered user."""
+
+        if user_id <= 0 or amount_usdt_micros <= 0:
+            raise ValueError("user_id and deposit amount must be positive")
+        if amount_usdt_micros > MAX_SQLITE_INTEGER:
+            raise ValueError("deposit amount exceeds the supported database range")
+        if reservation_ttl <= timedelta(0):
+            raise ValueError("reservation_ttl must be positive")
+        explicit_current = _as_utc(now) if now is not None else None
+        async with self._lock:
+            connection = self._require_connection()
+            try:
+                async with self._transaction(connection):
+                    current = explicit_current or _utc_now()
+                    current_db = _to_db_datetime(current)
+                    expires_db = _to_db_datetime(current + reservation_ttl)
+                    user = await _fetchone(
+                        connection,
+                        "SELECT telegram_id FROM users WHERE telegram_id = ?",
+                        (user_id,),
+                    )
+                    if user is None:
+                        raise UserNotFound(f"user {user_id} is not registered")
+                    await self._expire_due_balance_deposits_in_transaction(
+                        connection,
+                        current=current,
+                        limit=MAX_CLEANUP_BATCH,
+                        user_id=user_id,
+                    )
+                    active = await _fetchone(
+                        connection,
+                        """
+                        SELECT id FROM balance_deposits
+                        WHERE user_id = ? AND status IN (?, ?)
+                        ORDER BY created_at DESC, id DESC LIMIT 1
+                        """,
+                        (
+                            user_id,
+                            BalanceDepositStatus.AWAITING_PAYMENT.value,
+                            BalanceDepositStatus.AWAITING_REVIEW.value,
+                        ),
+                    )
+                    if active is not None:
+                        raise PendingBalanceDepositExists(int(active["id"]))
+                    note: str | None = None
+                    for _ in range(20):
+                        candidate = f"BAL-{uuid.uuid4().hex[:10].upper()}"
+                        duplicate = await _fetchone(
+                            connection,
+                            "SELECT 1 FROM balance_deposits WHERE payment_note = ?",
+                            (candidate,),
+                        )
+                        if duplicate is None:
+                            note = candidate
+                            break
+                    if note is None:
+                        raise PaymentConflict("could not generate a unique deposit note")
+                    await _execute(
+                        connection,
+                        """
+                        INSERT INTO balance_deposits(
+                            user_id, amount_usdt_micros, payment_note, status,
+                            reservation_expires_at, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            user_id,
+                            amount_usdt_micros,
+                            note,
+                            BalanceDepositStatus.AWAITING_PAYMENT.value,
+                            expires_db,
+                            current_db,
+                            current_db,
+                        ),
+                    )
+                    row = await _fetchone(
+                        connection,
+                        "SELECT * FROM balance_deposits WHERE id = last_insert_rowid()",
+                    )
+            except sqlite3.IntegrityError as exc:
+                raise PaymentConflict("balance deposit could not be created") from exc
+        assert row is not None
+        return _balance_deposit_from_row(row)
+
+    async def get_balance_deposit(
+        self,
+        deposit_id: int,
+        *,
+        user_id: int | None = None,
+    ) -> BalanceDeposit | None:
+        query = "SELECT * FROM balance_deposits WHERE id = ?"
+        parameters: tuple[Any, ...] = (deposit_id,)
+        if user_id is not None:
+            query += " AND user_id = ?"
+            parameters += (user_id,)
+        async with self._lock:
+            row = await _fetchone(self._require_connection(), query, parameters)
+        return _balance_deposit_from_row(row) if row is not None else None
+
+    async def get_active_balance_deposit(self, user_id: int) -> BalanceDeposit | None:
+        async with self._lock:
+            row = await _fetchone(
+                self._require_connection(),
+                """
+                SELECT * FROM balance_deposits
+                WHERE user_id = ? AND status IN (?, ?)
+                ORDER BY created_at DESC, id DESC LIMIT 1
+                """,
+                (
+                    user_id,
+                    BalanceDepositStatus.AWAITING_PAYMENT.value,
+                    BalanceDepositStatus.AWAITING_REVIEW.value,
+                ),
+            )
+        return _balance_deposit_from_row(row) if row is not None else None
+
+    async def list_balance_deposits(
+        self,
+        *,
+        user_id: int | None = None,
+        status: BalanceDepositStatus | str | None = None,
+        review_only: bool = False,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[BalanceDeposit]:
+        _validate_page(limit, offset)
+        conditions: list[str] = []
+        parameters: list[Any] = []
+        if user_id is not None:
+            conditions.append("user_id = ?")
+            parameters.append(user_id)
+        if status is not None:
+            conditions.append("status = ?")
+            parameters.append(BalanceDepositStatus(status).value)
+        if review_only:
+            conditions.append("status = ?")
+            parameters.append(BalanceDepositStatus.AWAITING_REVIEW.value)
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        parameters.extend((limit, offset))
+        async with self._lock:
+            rows = await _fetchall(
+                self._require_connection(),
+                f"""
+                SELECT * FROM balance_deposits {where}
+                ORDER BY COALESCE(payment_claimed_at, created_at) DESC, id DESC
+                LIMIT ? OFFSET ?
+                """,
+                parameters,
+            )
+        return [_balance_deposit_from_row(row) for row in rows]
+
+    async def acknowledge_balance_deposit(
+        self,
+        deposit_id: int,
+        user_id: int,
+        *,
+        now: datetime | None = None,
+    ) -> BalanceDeposit:
+        explicit_current = _as_utc(now) if now is not None else None
+        expired = False
+        result: BalanceDeposit | None = None
+        async with self._lock:
+            connection = self._require_connection()
+            async with self._transaction(connection):
+                current = explicit_current or _utc_now()
+                current_db = _to_db_datetime(current)
+                deposit = await self._get_balance_deposit_for_update(
+                    connection,
+                    deposit_id,
+                    user_id=user_id,
+                )
+                deposit = await self._expire_balance_deposit_if_due_in_transaction(
+                    connection,
+                    deposit,
+                    current=current,
+                )
+                if deposit.status is BalanceDepositStatus.EXPIRED:
+                    expired = True
+                    result = deposit
+                elif deposit.status is BalanceDepositStatus.AWAITING_REVIEW:
+                    result = deposit
+                elif deposit.status is BalanceDepositStatus.AWAITING_PAYMENT:
+                    await _execute(
+                        connection,
+                        """
+                        UPDATE balance_deposits
+                        SET status = ?, payment_claimed_at = ?,
+                            reservation_expires_at = NULL, updated_at = ?
+                        WHERE id = ? AND status = ?
+                        """,
+                        (
+                            BalanceDepositStatus.AWAITING_REVIEW.value,
+                            current_db,
+                            current_db,
+                            deposit_id,
+                            BalanceDepositStatus.AWAITING_PAYMENT.value,
+                        ),
+                    )
+                    row = await _fetchone(
+                        connection,
+                        "SELECT * FROM balance_deposits WHERE id = ?",
+                        (deposit_id,),
+                    )
+                    assert row is not None
+                    result = _balance_deposit_from_row(row)
+                else:
+                    raise InvalidOrderTransition("balance deposit is already resolved")
+        if expired:
+            raise ReservationExpired(f"balance deposit {deposit_id} has expired")
+        assert result is not None
+        return result
+
+    async def submit_balance_deposit_transfer(
+        self,
+        deposit_id: int,
+        user_id: int,
+        transfer_id: str,
+        *,
+        now: datetime | None = None,
+    ) -> BalanceDeposit:
+        display_transfer_id, normalized_transfer_id = _normalize_binance_transfer_id(
+            transfer_id
+        )
+        explicit_current = _as_utc(now) if now is not None else None
+        expired = False
+        result: BalanceDeposit | None = None
+        async with self._lock:
+            connection = self._require_connection()
+            try:
+                async with self._transaction(connection):
+                    current = explicit_current or _utc_now()
+                    current_db = _to_db_datetime(current)
+                    deposit = await self._get_balance_deposit_for_update(
+                        connection,
+                        deposit_id,
+                        user_id=user_id,
+                    )
+                    deposit = await self._expire_balance_deposit_if_due_in_transaction(
+                        connection,
+                        deposit,
+                        current=current,
+                    )
+                    if deposit.status is BalanceDepositStatus.EXPIRED:
+                        expired = True
+                        result = deposit
+                    elif deposit.status not in {
+                        BalanceDepositStatus.AWAITING_PAYMENT,
+                        BalanceDepositStatus.AWAITING_REVIEW,
+                    }:
+                        raise InvalidOrderTransition("balance deposit is already resolved")
+                    elif deposit.binance_transfer_id is not None:
+                        if (
+                            deposit.binance_transfer_id.casefold()
+                            == display_transfer_id.casefold()
+                        ):
+                            result = deposit
+                        else:
+                            raise PaymentConflict("a different transfer ID is already submitted")
+                    else:
+                        await self._claim_binance_transfer_in_transaction(
+                            connection,
+                            transfer_id=display_transfer_id,
+                            normalized_transfer_id=normalized_transfer_id,
+                            current_db=current_db,
+                            deposit_id=deposit_id,
+                        )
+                        await _execute(
+                            connection,
+                            """
+                            UPDATE balance_deposits
+                            SET binance_transfer_id = ?, status = ?,
+                                payment_claimed_at = COALESCE(payment_claimed_at, ?),
+                                reservation_expires_at = NULL, updated_at = ?
+                            WHERE id = ? AND status IN (?, ?)
+                            """,
+                            (
+                                display_transfer_id,
+                                BalanceDepositStatus.AWAITING_REVIEW.value,
+                                current_db,
+                                current_db,
+                                deposit_id,
+                                BalanceDepositStatus.AWAITING_PAYMENT.value,
+                                BalanceDepositStatus.AWAITING_REVIEW.value,
+                            ),
+                        )
+                        row = await _fetchone(
+                            connection,
+                            "SELECT * FROM balance_deposits WHERE id = ?",
+                            (deposit_id,),
+                        )
+                        assert row is not None
+                        result = _balance_deposit_from_row(row)
+            except sqlite3.IntegrityError as exc:
+                raise PaymentConflict("this transfer ID was already submitted") from exc
+        if expired:
+            raise ReservationExpired(f"balance deposit {deposit_id} has expired")
+        assert result is not None
+        return result
+
+    async def confirm_balance_deposit(
+        self,
+        deposit_id: int,
+        admin_id: int,
+        *,
+        now: datetime | None = None,
+    ) -> BalanceDeposit:
+        if admin_id <= 0:
+            raise ValueError("admin_id must be positive")
+        explicit_current = _as_utc(now) if now is not None else None
+        async with self._lock:
+            connection = self._require_connection()
+            async with self._transaction(connection):
+                current_db = _to_db_datetime(explicit_current or _utc_now())
+                deposit = await self._get_balance_deposit_for_update(connection, deposit_id)
+                if deposit.status is BalanceDepositStatus.CONFIRMED:
+                    return deposit
+                if (
+                    deposit.status is not BalanceDepositStatus.AWAITING_REVIEW
+                    or not deposit.binance_transfer_id
+                ):
+                    raise InvalidOrderTransition(
+                        "balance deposit cannot be confirmed without a transfer ID"
+                    )
+                await self._insert_balance_transaction_in_transaction(
+                    connection,
+                    user_id=deposit.user_id,
+                    delta_usdt_micros=deposit.amount_usdt_micros,
+                    kind=BalanceTransactionKind.BINANCE_DEPOSIT,
+                    current_db=current_db,
+                    deposit_id=deposit.id,
+                    admin_id=admin_id,
+                    note=f"Binance wallet deposit #{deposit.id}",
+                    idempotency_key=f"balance-deposit:{deposit.id}:confirm",
+                )
+                await _execute(
+                    connection,
+                    """
+                    UPDATE balance_deposits
+                    SET status = ?, confirmed_at = ?, reviewed_by = ?, updated_at = ?
+                    WHERE id = ? AND status = ?
+                    """,
+                    (
+                        BalanceDepositStatus.CONFIRMED.value,
+                        current_db,
+                        admin_id,
+                        current_db,
+                        deposit.id,
+                        BalanceDepositStatus.AWAITING_REVIEW.value,
+                    ),
+                )
+                row = await _fetchone(
+                    connection,
+                    "SELECT * FROM balance_deposits WHERE id = ?",
+                    (deposit.id,),
+                )
+        assert row is not None
+        return _balance_deposit_from_row(row)
+
+    async def reject_balance_deposit(
+        self,
+        deposit_id: int,
+        admin_id: int,
+        *,
+        now: datetime | None = None,
+    ) -> BalanceDeposit:
+        if admin_id <= 0:
+            raise ValueError("admin_id must be positive")
+        explicit_current = _as_utc(now) if now is not None else None
+        async with self._lock:
+            connection = self._require_connection()
+            async with self._transaction(connection):
+                current_db = _to_db_datetime(explicit_current or _utc_now())
+                deposit = await self._get_balance_deposit_for_update(connection, deposit_id)
+                if deposit.status is BalanceDepositStatus.REJECTED:
+                    return deposit
+                if deposit.status not in {
+                    BalanceDepositStatus.AWAITING_PAYMENT,
+                    BalanceDepositStatus.AWAITING_REVIEW,
+                }:
+                    raise InvalidOrderTransition("balance deposit is already resolved")
+                await _execute(
+                    connection,
+                    """
+                    UPDATE balance_deposits
+                    SET status = ?, reservation_expires_at = NULL,
+                        rejected_at = ?, reviewed_by = ?, updated_at = ?
+                    WHERE id = ? AND status IN (?, ?)
+                    """,
+                    (
+                        BalanceDepositStatus.REJECTED.value,
+                        current_db,
+                        admin_id,
+                        current_db,
+                        deposit.id,
+                        BalanceDepositStatus.AWAITING_PAYMENT.value,
+                        BalanceDepositStatus.AWAITING_REVIEW.value,
+                    ),
+                )
+                row = await _fetchone(
+                    connection,
+                    "SELECT * FROM balance_deposits WHERE id = ?",
+                    (deposit.id,),
+                )
+        assert row is not None
+        return _balance_deposit_from_row(row)
+
+    async def cleanup_expired_balance_deposits(
+        self,
+        *,
+        now: datetime | None = None,
+        limit: int = MAX_CLEANUP_BATCH,
+    ) -> int:
+        if not 1 <= limit <= MAX_CLEANUP_BATCH:
+            raise ValueError(f"limit must be between 1 and {MAX_CLEANUP_BATCH}")
+        explicit_current = _as_utc(now) if now is not None else None
+        async with self._lock:
+            connection = self._require_connection()
+            async with self._transaction(connection):
+                current = explicit_current or _utc_now()
+                return await self._expire_due_balance_deposits_in_transaction(
+                    connection,
+                    current=current,
+                    limit=limit,
+                )
 
     async def accept_terms(self, user_id: int, version: str) -> None:
         normalized_version = version.strip()
@@ -2139,13 +2875,7 @@ class Database:
         *,
         now: datetime | None = None,
     ) -> Order:
-        transfer_id = transfer_id.strip()
-        if (
-            not 4 <= len(transfer_id) <= 128
-            or not transfer_id.isascii()
-            or any(character.isspace() or not character.isprintable() for character in transfer_id)
-        ):
-            raise ValueError("invalid Binance transfer ID")
+        transfer_id, normalized_transfer_id = _normalize_binance_transfer_id(transfer_id)
         explicit_current = _as_utc(now) if now is not None else None
         expired = False
         result: Order | None = None
@@ -2175,6 +2905,13 @@ class Database:
                                     "a different transfer ID is already submitted"
                                 )
                         else:
+                            await self._claim_binance_transfer_in_transaction(
+                                connection,
+                                transfer_id=transfer_id,
+                                normalized_transfer_id=normalized_transfer_id,
+                                current_db=current_db,
+                                order_id=order_id,
+                            )
                             await _execute(
                                 connection,
                                 """
@@ -2195,6 +2932,105 @@ class Database:
                             result = _order_from_row(row)
             except sqlite3.IntegrityError as exc:
                 raise PaymentConflict("this transfer ID was already submitted") from exc
+        if expired:
+            raise ReservationExpired(f"reservation for order {order_id} has expired")
+        assert result is not None
+        return result
+
+    async def pay_order_from_balance(
+        self,
+        order_id: int,
+        user_id: int,
+        *,
+        now: datetime | None = None,
+    ) -> Order:
+        """Pay one already-reserved order from the customer's wallet exactly once."""
+
+        if order_id <= 0 or user_id <= 0:
+            raise ValueError("order_id and user_id must be positive")
+        explicit_current = _as_utc(now) if now is not None else None
+        expired = False
+        result: Order | None = None
+        async with self._lock:
+            connection = self._require_connection()
+            async with self._transaction(connection):
+                current = explicit_current or _utc_now()
+                current_db = _to_db_datetime(current)
+                order = await self._get_order_for_update(
+                    connection,
+                    order_id,
+                    user_id,
+                )
+                payment_row = await _fetchone(
+                    connection,
+                    """
+                    SELECT * FROM balance_transactions
+                    WHERE order_id = ? AND kind = ?
+                    """,
+                    (order.id, BalanceTransactionKind.ORDER_PAYMENT.value),
+                )
+                if order.status is OrderStatus.PAID and payment_row is not None:
+                    return order
+                if order.status is OrderStatus.PAID:
+                    raise InvalidOrderTransition(
+                        f"order {order.id} was paid using another payment method"
+                    )
+                order = await self._expire_order_if_due_in_transaction(
+                    connection,
+                    order,
+                    current=current,
+                )
+                if order.status is OrderStatus.EXPIRED:
+                    expired = True
+                    result = order
+                else:
+                    if order.status is not OrderStatus.AWAITING_PAYMENT:
+                        raise InvalidOrderTransition(
+                            f"cannot pay order {order.id} from status {order.status}"
+                        )
+                    if order.payment_claimed_at is not None or order.binance_transfer_id:
+                        raise InvalidOrderTransition(
+                            "a Binance transfer is already awaiting administrator review"
+                        )
+                    amount = order.manual_amount_usdt_micros
+                    if amount is None or amount <= 0:
+                        raise InvalidOrderTransition("order has no USDT amount")
+                    await self._insert_balance_transaction_in_transaction(
+                        connection,
+                        user_id=user_id,
+                        delta_usdt_micros=-amount,
+                        kind=BalanceTransactionKind.ORDER_PAYMENT,
+                        current_db=current_db,
+                        order_id=order.id,
+                        note=f"Wallet payment for order #{order.id}",
+                        idempotency_key=f"balance-order:{order.id}:payment",
+                    )
+                    changed = await _execute(
+                        connection,
+                        """
+                        UPDATE orders
+                        SET status = ?, paid_at = ?, reservation_expires_at = NULL,
+                            updated_at = ?
+                        WHERE id = ? AND user_id = ? AND status = ?
+                        """,
+                        (
+                            OrderStatus.PAID.value,
+                            current_db,
+                            current_db,
+                            order.id,
+                            user_id,
+                            OrderStatus.AWAITING_PAYMENT.value,
+                        ),
+                    )
+                    if changed != 1:
+                        raise BalanceConflict("order payment state changed concurrently")
+                    row = await _fetchone(
+                        connection,
+                        "SELECT * FROM orders WHERE id = ?",
+                        (order.id,),
+                    )
+                    assert row is not None
+                    result = _order_from_row(row)
         if expired:
             raise ReservationExpired(f"reservation for order {order_id} has expired")
         assert result is not None
@@ -2629,6 +3465,26 @@ class Database:
                     raise InvalidOrderTransition(
                         f"cannot refund order {order.id} from status {order.status}"
                     )
+                balance_payment_row = await _fetchone(
+                    connection,
+                    """
+                    SELECT * FROM balance_transactions
+                    WHERE order_id = ? AND kind = ?
+                    """,
+                    (order.id, BalanceTransactionKind.ORDER_PAYMENT.value),
+                )
+                if balance_payment_row is not None:
+                    balance_payment = _balance_transaction_from_row(balance_payment_row)
+                    await self._insert_balance_transaction_in_transaction(
+                        connection,
+                        user_id=order.user_id,
+                        delta_usdt_micros=-balance_payment.delta_usdt_micros,
+                        kind=BalanceTransactionKind.ORDER_REFUND,
+                        current_db=current_db,
+                        order_id=order.id,
+                        note=f"Wallet refund for order #{order.id}",
+                        idempotency_key=f"balance-order:{order.id}:refund",
+                    )
                 if order.status is OrderStatus.DELIVERED:
                     await _execute(
                         connection,
@@ -2981,6 +3837,251 @@ class Database:
             gross_stars=int(row["gross_stars"]),
         )
 
+    async def _insert_balance_transaction_in_transaction(
+        self,
+        connection: aiosqlite.Connection,
+        *,
+        user_id: int,
+        delta_usdt_micros: int,
+        kind: BalanceTransactionKind,
+        current_db: str,
+        order_id: int | None = None,
+        deposit_id: int | None = None,
+        admin_id: int | None = None,
+        note: str = "",
+        idempotency_key: str | None = None,
+    ) -> BalanceTransaction:
+        if idempotency_key is not None:
+            existing = await _fetchone(
+                connection,
+                "SELECT * FROM balance_transactions WHERE idempotency_key = ?",
+                (idempotency_key,),
+            )
+            if existing is not None:
+                transaction = _balance_transaction_from_row(existing)
+                if (
+                    transaction.user_id == user_id
+                    and transaction.delta_usdt_micros == delta_usdt_micros
+                    and transaction.kind is kind
+                    and transaction.order_id == order_id
+                    and transaction.deposit_id == deposit_id
+                    and transaction.admin_id == admin_id
+                    and transaction.note == note
+                ):
+                    return transaction
+                raise BalanceConflict("idempotency key belongs to another balance operation")
+
+        user_row = await _fetchone(
+            connection,
+            "SELECT balance_usdt_micros FROM users WHERE telegram_id = ?",
+            (user_id,),
+        )
+        if user_row is None:
+            raise UserNotFound(f"user {user_id} is not registered")
+        available = int(user_row["balance_usdt_micros"])
+        balance_after = available + delta_usdt_micros
+        if balance_after < 0:
+            raise InsufficientBalance(required=-delta_usdt_micros, available=available)
+        if balance_after > MAX_SQLITE_INTEGER:
+            raise BalanceConflict("balance exceeds the supported database range")
+
+        changed = await _execute(
+            connection,
+            """
+            UPDATE users
+            SET balance_usdt_micros = ?, updated_at = ?
+            WHERE telegram_id = ? AND balance_usdt_micros = ?
+            """,
+            (balance_after, current_db, user_id, available),
+        )
+        if changed != 1:
+            raise BalanceConflict("balance changed concurrently")
+        try:
+            await _execute(
+                connection,
+                """
+                INSERT INTO balance_transactions(
+                    user_id, delta_usdt_micros, balance_after_usdt_micros,
+                    kind, order_id, deposit_id, admin_id, note,
+                    idempotency_key, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    user_id,
+                    delta_usdt_micros,
+                    balance_after,
+                    kind.value,
+                    order_id,
+                    deposit_id,
+                    admin_id,
+                    note,
+                    idempotency_key,
+                    current_db,
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise BalanceConflict("balance operation was already recorded") from exc
+        row = await _fetchone(
+            connection,
+            "SELECT * FROM balance_transactions WHERE id = last_insert_rowid()",
+        )
+        assert row is not None
+        return _balance_transaction_from_row(row)
+
+    async def _get_balance_deposit_for_update(
+        self,
+        connection: aiosqlite.Connection,
+        deposit_id: int,
+        *,
+        user_id: int | None = None,
+    ) -> BalanceDeposit:
+        query = "SELECT * FROM balance_deposits WHERE id = ?"
+        parameters: tuple[Any, ...] = (deposit_id,)
+        if user_id is not None:
+            query += " AND user_id = ?"
+            parameters += (user_id,)
+        row = await _fetchone(connection, query, parameters)
+        if row is None:
+            raise BalanceDepositNotFound(
+                f"balance deposit {deposit_id} does not exist for this user"
+            )
+        return _balance_deposit_from_row(row)
+
+    async def _expire_balance_deposit_if_due_in_transaction(
+        self,
+        connection: aiosqlite.Connection,
+        deposit: BalanceDeposit,
+        *,
+        current: datetime,
+    ) -> BalanceDeposit:
+        if (
+            deposit.status is not BalanceDepositStatus.AWAITING_PAYMENT
+            or deposit.reservation_expires_at is None
+            or deposit.reservation_expires_at > current
+        ):
+            return deposit
+        current_db = _to_db_datetime(current)
+        await _execute(
+            connection,
+            """
+            UPDATE balance_deposits
+            SET status = ?, reservation_expires_at = NULL,
+                expired_at = ?, updated_at = ?
+            WHERE id = ? AND status = ?
+            """,
+            (
+                BalanceDepositStatus.EXPIRED.value,
+                current_db,
+                current_db,
+                deposit.id,
+                BalanceDepositStatus.AWAITING_PAYMENT.value,
+            ),
+        )
+        row = await _fetchone(
+            connection,
+            "SELECT * FROM balance_deposits WHERE id = ?",
+            (deposit.id,),
+        )
+        assert row is not None
+        return _balance_deposit_from_row(row)
+
+    async def _expire_due_balance_deposits_in_transaction(
+        self,
+        connection: aiosqlite.Connection,
+        *,
+        current: datetime,
+        limit: int,
+        user_id: int | None = None,
+    ) -> int:
+        current_db = _to_db_datetime(current)
+        user_clause = " AND user_id = ?" if user_id is not None else ""
+        parameters: list[Any] = [
+            BalanceDepositStatus.AWAITING_PAYMENT.value,
+            current_db,
+        ]
+        if user_id is not None:
+            parameters.append(user_id)
+        parameters.append(limit)
+        rows = await _fetchall(
+            connection,
+            f"""
+            SELECT id FROM balance_deposits
+            WHERE status = ? AND reservation_expires_at <= ?{user_clause}
+            ORDER BY reservation_expires_at, id
+            LIMIT ?
+            """,
+            parameters,
+        )
+        if not rows:
+            return 0
+        deposit_ids = [int(row["id"]) for row in rows]
+        placeholders = ",".join("?" for _ in deposit_ids)
+        await _execute(
+            connection,
+            f"""
+            UPDATE balance_deposits
+            SET status = ?, reservation_expires_at = NULL,
+                expired_at = ?, updated_at = ?
+            WHERE status = ? AND id IN ({placeholders})
+            """,
+            (
+                BalanceDepositStatus.EXPIRED.value,
+                current_db,
+                current_db,
+                BalanceDepositStatus.AWAITING_PAYMENT.value,
+                *deposit_ids,
+            ),
+        )
+        return len(deposit_ids)
+
+    async def _claim_binance_transfer_in_transaction(
+        self,
+        connection: aiosqlite.Connection,
+        *,
+        transfer_id: str,
+        normalized_transfer_id: str,
+        current_db: str,
+        order_id: int | None = None,
+        deposit_id: int | None = None,
+    ) -> None:
+        if (order_id is None) == (deposit_id is None):
+            raise ValueError("a transfer claim must belong to exactly one payment")
+        existing = await _fetchone(
+            connection,
+            """
+            SELECT order_id, deposit_id
+            FROM binance_transfer_claims
+            WHERE normalized_transfer_id = ?
+            """,
+            (normalized_transfer_id,),
+        )
+        if existing is not None:
+            if (
+                (order_id is not None and existing["order_id"] == order_id)
+                or (deposit_id is not None and existing["deposit_id"] == deposit_id)
+            ):
+                return
+            raise PaymentConflict("this transfer ID was already submitted")
+        try:
+            await _execute(
+                connection,
+                """
+                INSERT INTO binance_transfer_claims(
+                    normalized_transfer_id, display_transfer_id,
+                    order_id, deposit_id, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    normalized_transfer_id,
+                    transfer_id,
+                    order_id,
+                    deposit_id,
+                    current_db,
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise PaymentConflict("this transfer ID was already submitted") from exc
+
     async def _get_order_for_update(
         self,
         connection: aiosqlite.Connection,
@@ -3177,6 +4278,17 @@ def _validate_invoice_payload(payload: str) -> None:
     size = len(payload.encode("utf-8"))
     if not 1 <= size <= 128:
         raise ValueError("invoice_payload must contain between 1 and 128 UTF-8 bytes")
+
+
+def _normalize_binance_transfer_id(transfer_id: str) -> tuple[str, str]:
+    display = transfer_id.strip()
+    if (
+        not 4 <= len(display) <= 128
+        or not display.isascii()
+        or any(character.isspace() or not character.isprintable() for character in display)
+    ):
+        raise ValueError("invalid Binance transfer ID")
+    return display, display.casefold()
 
 
 def _validate_page(limit: int, offset: int) -> None:

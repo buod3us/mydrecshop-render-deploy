@@ -2,6 +2,7 @@
 .gitignore
 .env
 .venv
+.codex-deps
 __pycache__
 *.py[cod]
 .pytest_cache

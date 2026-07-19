@@ -7,8 +7,11 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from .callbacks import (
     AdminActionCallback,
+    AdminBalanceDepositCallback,
     AdminPaymentReviewCallback,
     AdminProductCallback,
+    BalanceDepositCallback,
+    BalancePayCallback,
     BuyCallback,
     ConfirmBinanceCallback,
     CustomQuantityCallback,
@@ -23,6 +26,7 @@ from .callbacks import (
     RejectBinanceCallback,
     SubmitBinanceCallback,
     SubscriptionCallback,
+    WalletCallback,
 )
 from .config import Config
 from .formatting import clip, format_usdt
@@ -87,6 +91,15 @@ def home_keyboard(
             custom_emoji_id=icons.get("profile"),
             use_custom_icons=use_custom_icons,
         ),
+    )
+    builder.row(
+        _button(
+            label=t("home.wallet", locale),
+            callback_data=WalletCallback(action="open").pack(),
+            fallback_icon="💰",
+            custom_emoji_id=icons.get("payment"),
+            use_custom_icons=use_custom_icons,
+        )
     )
     builder.row(
         _button(
@@ -399,6 +412,129 @@ def profile_keyboard(
     return builder.as_markup()
 
 
+def wallet_keyboard(
+    locale: LanguageLike,
+    config: Config,
+    use_custom_icons: bool = True,
+    *,
+    has_active_deposit: bool = False,
+) -> InlineKeyboardMarkup:
+    """Actions available from a customer's USDT wallet."""
+
+    icons = config.menu_custom_emojis
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        _button(
+            label=t("wallet.top_up", locale),
+            callback_data=WalletCallback(action="top_up").pack(),
+            fallback_icon="➕",
+            custom_emoji_id=icons.get("increase"),
+            use_custom_icons=use_custom_icons,
+        )
+    )
+    if has_active_deposit:
+        builder.row(
+            _button(
+                label=t("wallet.open_deposit", locale),
+                callback_data=WalletCallback(action="active_deposit").pack(),
+                fallback_icon="💳",
+                custom_emoji_id=icons.get("payment"),
+                use_custom_icons=use_custom_icons,
+            )
+        )
+    builder.row(
+        _button(
+            label=t("common.back", locale),
+            callback_data=NavigationCallback(page="home").pack(),
+            fallback_icon="⬅️",
+            custom_emoji_id=icons.get("back"),
+            use_custom_icons=use_custom_icons,
+        )
+    )
+    return builder.as_markup()
+
+
+def balance_deposit_keyboard(
+    deposit_id: int,
+    locale: LanguageLike,
+    config: Config,
+    use_custom_icons: bool = True,
+    *,
+    submitted: bool = False,
+) -> InlineKeyboardMarkup:
+    """Controls for an open Binance wallet top-up request."""
+
+    icons = config.menu_custom_emojis
+    builder = InlineKeyboardBuilder()
+    if not submitted:
+        builder.row(
+            _button(
+                label=t("wallet.deposit.sent", locale),
+                callback_data=BalanceDepositCallback(
+                    action="sent",
+                    deposit_id=deposit_id,
+                ).pack(),
+                fallback_icon="✅",
+                custom_emoji_id=icons.get("payment"),
+                use_custom_icons=use_custom_icons,
+            )
+        )
+    builder.row(
+        _button(
+            label=t("wallet.back", locale),
+            callback_data=WalletCallback(action="open").pack(),
+            fallback_icon="⬅️",
+            custom_emoji_id=icons.get("back"),
+            use_custom_icons=use_custom_icons,
+        )
+    )
+    return builder.as_markup()
+
+
+def admin_balance_deposit_keyboard(
+    deposit_id: int,
+    *,
+    reviewed: bool = False,
+    can_confirm: bool = True,
+) -> InlineKeyboardMarkup:
+    """Manual administrator review controls for a balance top-up."""
+
+    buttons: list[list[InlineKeyboardButton]] = []
+    if not reviewed:
+        if can_confirm:
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        text="✅ Подтвердить пополнение",
+                        callback_data=AdminBalanceDepositCallback(
+                            action="confirm",
+                            deposit_id=deposit_id,
+                        ).pack(),
+                    )
+                ]
+            )
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    text="❌ Отклонить пополнение",
+                    callback_data=AdminBalanceDepositCallback(
+                        action="reject",
+                        deposit_id=deposit_id,
+                    ).pack(),
+                )
+            ]
+        )
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                text="⚙️ Админ-панель",
+                callback_data=AdminActionCallback(action="panel").pack(),
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
 def orders_keyboard(
     rows: Sequence[tuple[Order, Product]],
     locale: LanguageLike,
@@ -518,6 +654,15 @@ def binance_payment_keyboard(
         inline_keyboard=[
             [
                 _button(
+                    label=t("wallet.pay_from_balance", locale),
+                    callback_data=BalancePayCallback(order_id=order_id).pack(),
+                    fallback_icon="💰",
+                    custom_emoji_id=icons.get("payment"),
+                    use_custom_icons=use_custom_icons,
+                )
+            ],
+            [
+                _button(
                     label=text,
                     callback_data=SubmitBinanceCallback(order_id=order_id).pack(),
                     fallback_icon="✅",
@@ -616,6 +761,12 @@ def admin_panel_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     text="🔎 Платежи на проверке",
                     callback_data=AdminActionCallback(action="review").pack(),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="💰 Пополнения баланса",
+                    callback_data=AdminActionCallback(action="balance_deposits").pack(),
                 )
             ],
             [

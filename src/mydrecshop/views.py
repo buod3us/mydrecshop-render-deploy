@@ -6,7 +6,16 @@ from html import escape
 
 from .formatting import format_usdt
 from .i18n import Language, LanguageLike, TrustedHTML, normalize_language, t, translator
-from .models import Order, OrderStatus, Product, ProductPriceTier, User
+from .models import (
+    BalanceDeposit,
+    BalanceDepositStatus,
+    BalanceTransaction,
+    Order,
+    OrderStatus,
+    Product,
+    ProductPriceTier,
+    User,
+)
 from .theme import theme_html
 
 
@@ -141,6 +150,7 @@ def profile_text(
         language=language_name,
         orders_count=orders_count,
         orders_word=translator.plural("order", orders_count, language),
+        balance=format_usdt(user.balance_usdt_micros),
         spent=format_usdt(spent_usdt_micros),
         currency="USDT",
         registered_at=user.created_at.astimezone(UTC).strftime("%d.%m.%Y"),
@@ -151,8 +161,121 @@ def profile_text(
         ),
         language_icon=_theme_value("language", use_custom_emoji=use_custom_emoji),
         orders_icon=_theme_value("orders", use_custom_emoji=use_custom_emoji),
+        balance_icon=_theme_value("price", use_custom_emoji=use_custom_emoji),
         payment_icon=_theme_value("payment", use_custom_emoji=use_custom_emoji),
         calendar_icon=_theme_value("calendar", use_custom_emoji=use_custom_emoji),
+    )
+
+
+def wallet_text(
+    user: User,
+    *,
+    recent_transactions: Sequence[BalanceTransaction] = (),
+    use_custom_emoji: bool = True,
+) -> str:
+    """Render a localized wallet summary with a short auditable history."""
+
+    language = normalize_language(user.locale.value)
+    lines: list[str] = []
+    for transaction in recent_transactions[:5]:
+        sign = "+" if transaction.delta_usdt_micros > 0 else "−"
+        kind = t(  # type: ignore[arg-type]
+            f"wallet.transaction.{transaction.kind.value}",
+            language,
+        )
+        lines.append(
+            t(
+                "wallet.transaction_line",
+                language,
+                amount=f"{sign}{format_usdt(abs(transaction.delta_usdt_micros))}",
+                currency="USDT",
+                kind=kind,
+                created_at=transaction.created_at.astimezone(UTC).strftime(
+                    "%d.%m.%Y %H:%M UTC"
+                ),
+            )
+        )
+    history = "\n".join(lines) if lines else t("wallet.no_transactions", language)
+    return t(
+        "wallet.message",
+        language,
+        balance=format_usdt(user.balance_usdt_micros),
+        currency="USDT",
+        history=TrustedHTML(history),
+        wallet_icon=_theme_value("payment", use_custom_emoji=use_custom_emoji),
+        balance_icon=_theme_value("price", use_custom_emoji=use_custom_emoji),
+    )
+
+
+def balance_deposit_text(
+    deposit: BalanceDeposit,
+    locale: LanguageLike,
+    *,
+    binance_id: str = "",
+    balance_usdt_micros: int = 0,
+    use_custom_emoji: bool = True,
+) -> str:
+    """Render the current customer-facing state of a Binance wallet top-up."""
+
+    language = normalize_language(locale)
+    common = {
+        "deposit_id": deposit.id,
+        "amount": format_usdt(deposit.amount_usdt_micros),
+        "currency": "USDT",
+    }
+    if deposit.status is BalanceDepositStatus.AWAITING_PAYMENT:
+        expires_at = (
+            deposit.reservation_expires_at.astimezone(UTC).strftime(
+                "%d.%m.%Y %H:%M UTC"
+            )
+            if deposit.reservation_expires_at
+            else t("common.not_available", language)
+        )
+        return t(
+            "wallet.deposit.details",
+            language,
+            **common,
+            binance_id=binance_id,
+            payment_note=deposit.payment_note,
+            expires_at=expires_at,
+            payment_icon=_theme_value("payment", use_custom_emoji=use_custom_emoji),
+        )
+    if deposit.status is BalanceDepositStatus.AWAITING_REVIEW:
+        if not deposit.binance_transfer_id:
+            return t("wallet.deposit.transfer_prompt", language)
+        return t(
+            "wallet.deposit.review",
+            language,
+            **common,
+            transfer_id=deposit.binance_transfer_id,
+            pending_icon=_theme_value("pending", use_custom_emoji=use_custom_emoji),
+        )
+    if deposit.status is BalanceDepositStatus.CONFIRMED:
+        return t(
+            "wallet.deposit.confirmed",
+            language,
+            **common,
+            balance=format_usdt(balance_usdt_micros),
+        )
+    if deposit.status is BalanceDepositStatus.REJECTED:
+        return t("wallet.deposit.rejected", language, **common)
+    return t("wallet.deposit.expired", language, **common)
+
+
+def admin_balance_deposit_text(
+    deposit: BalanceDeposit,
+    user: User,
+) -> str:
+    """Render a compact Russian review card for bot administrators."""
+
+    transfer_id = escape(deposit.binance_transfer_id or "—")
+    return (
+        f"<b>💰 Пополнение баланса №{deposit.id}</b>\n\n"
+        f"<b>Клиент:</b> <code>{user.telegram_id}</code>\n"
+        f"<b>Сумма:</b> {format_usdt(deposit.amount_usdt_micros)} USDT\n"
+        f"<b>Note:</b> <code>{escape(deposit.payment_note)}</code>\n"
+        f"<b>ID перевода:</b> <code>{transfer_id}</code>\n"
+        f"<b>Статус:</b> {escape(deposit.status.value)}"
     )
 
 

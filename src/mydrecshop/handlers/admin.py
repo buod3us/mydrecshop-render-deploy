@@ -23,6 +23,7 @@ from cryptography.fernet import Fernet
 
 from ..callbacks import (
     AdminActionCallback,
+    AdminBalanceDepositCallback,
     AdminPaymentReviewCallback,
     AdminProductCallback,
     ConfirmBinanceCallback,
@@ -33,14 +34,17 @@ from ..config import Config
 from ..db import (
     MAX_ORDER_QUANTITY,
     Database,
+    InsufficientBalance,
     InsufficientInventory,
     InvalidOrderTransition,
     InventoryAlreadyClaimed,
     ProductDeletionBlocked,
     ShopDatabaseError,
+    UserNotFound,
 )
 from ..formatting import format_usdt
 from ..keyboards import (
+    admin_balance_deposit_keyboard,
     admin_broadcast_confirmation_keyboard,
     admin_delete_product_keyboard,
     admin_paid_orders_keyboard,
@@ -53,10 +57,14 @@ from ..keyboards import (
     product_notification_keyboard,
 )
 from ..media import send_themed_text
-from ..models import Locale, Order, OrderStatus, Product, ProductInput
+from ..models import BalanceDepositStatus, Locale, Order, OrderStatus, Product, ProductInput
 from ..theme import theme_html
 from ..translation import LocalizationResult, localize_texts
-from ..views import restock_notification_text
+from ..views import (
+    admin_balance_deposit_text,
+    balance_deposit_text,
+    restock_notification_text,
+)
 
 logger = logging.getLogger(__name__)
 router = Router(name="administration")
@@ -88,7 +96,9 @@ HELP = """<b>⚙️ Настройки бота</b>
 
 Здесь доступны товары, цены, описания, видимость в каталоге,
 база аккаунтов, остатки, выдача заказов, рассылка, технический режим
-и резервная копия.
+и резервная копия. Балансы клиентов доступны командами:
+<code>/balance ID</code>, <code>/addbalance ID сумма [примечание]</code>,
+<code>/subbalance ID сумма [примечание]</code>.
 
 Остаток нельзя увеличивать произвольным числом: он меняется только при
 загрузке или списании конкретных аккаунтов."""
@@ -543,6 +553,30 @@ async def admin_action(
             "Резервная копия создана.",
             reply_markup=admin_panel_keyboard(),
         )
+        return
+    if callback_data.action == "balance_deposits":
+        deposits = await db.list_balance_deposits(review_only=True, limit=50)
+        if not deposits:
+            await callback.message.answer(
+                "Пополнений баланса на проверке нет.",
+                reply_markup=admin_panel_keyboard(),
+            )
+            return
+        await callback.message.answer(
+            "<b>💰 Пополнения баланса на проверке</b>\n\n"
+            "Сверьте Binance ID, Note, сумму и ID перевода перед подтверждением."
+        )
+        for deposit in deposits:
+            customer = await db.get_user(deposit.user_id)
+            if customer is None:
+                continue
+            await callback.message.answer(
+                admin_balance_deposit_text(deposit, customer),
+                reply_markup=admin_balance_deposit_keyboard(
+                    deposit.id,
+                    can_confirm=bool(deposit.binance_transfer_id),
+                ),
+            )
         return
     if callback_data.action == "review" or callback_data.action.startswith("review_"):
         try:
@@ -1266,6 +1300,92 @@ async def restock_product_items(
     )
 
 
+@router.callback_query(AdminBalanceDepositCallback.filter())
+async def review_balance_deposit(
+    callback: CallbackQuery,
+    callback_data: AdminBalanceDepositCallback,
+    bot: Bot,
+    db: Database,
+    config: Config,
+) -> None:
+    if not config.is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    if callback_data.action not in {"confirm", "reject"}:
+        await callback.answer("Неизвестное действие.", show_alert=True)
+        return
+    before = await db.get_balance_deposit(callback_data.deposit_id)
+    if before is None:
+        await callback.answer("Заявка не найдена.", show_alert=True)
+        return
+    if before.status in {
+        BalanceDepositStatus.CONFIRMED,
+        BalanceDepositStatus.REJECTED,
+        BalanceDepositStatus.EXPIRED,
+    }:
+        await callback.answer("Заявка уже обработана.", show_alert=True)
+        if isinstance(callback.message, Message):
+            with contextlib.suppress(TelegramAPIError):
+                await callback.message.edit_reply_markup(
+                    reply_markup=admin_balance_deposit_keyboard(
+                        before.id,
+                        reviewed=True,
+                    )
+                )
+        return
+    try:
+        if callback_data.action == "confirm":
+            deposit = await db.confirm_balance_deposit(
+                before.id,
+                callback.from_user.id,
+            )
+            answer = "Пополнение подтверждено и зачислено."
+        else:
+            deposit = await db.reject_balance_deposit(
+                before.id,
+                callback.from_user.id,
+            )
+            answer = "Пополнение отклонено."
+    except ShopDatabaseError as exc:
+        await callback.answer(str(exc), show_alert=True)
+        return
+    await callback.answer(answer)
+    if isinstance(callback.message, Message):
+        customer = await db.get_user(deposit.user_id)
+        if customer is not None:
+            with contextlib.suppress(TelegramAPIError):
+                await callback.message.edit_text(
+                    admin_balance_deposit_text(deposit, customer),
+                    reply_markup=admin_balance_deposit_keyboard(
+                        deposit.id,
+                        reviewed=True,
+                    ),
+                )
+    customer = await db.get_user(deposit.user_id)
+    if customer is None:
+        return
+    try:
+        await send_themed_text(
+            lambda rendered, keyboard: bot.send_message(
+                deposit.user_id,
+                rendered,
+                reply_markup=keyboard,
+            ),
+            lambda custom: balance_deposit_text(
+                deposit,
+                customer.locale.value,
+                balance_usdt_micros=customer.balance_usdt_micros,
+                use_custom_emoji=custom,
+            ),
+        )
+    except TelegramAPIError:
+        logger.warning(
+            "Could not notify user %s about resolved balance deposit %s",
+            deposit.user_id,
+            deposit.id,
+        )
+
+
 @router.callback_query(ConfirmBinanceCallback.filter())
 async def confirm_binance_payment(
     callback: CallbackQuery,
@@ -1498,6 +1618,140 @@ async def admin_panel(
     await message.answer(
         await _admin_panel_text(db, config),
         reply_markup=admin_panel_keyboard(),
+    )
+
+
+@router.message(Command("balance"))
+async def show_customer_balance(
+    message: Message,
+    db: Database,
+    config: Config,
+    state: FSMContext,
+) -> None:
+    if not await _authorized(message, config):
+        return
+    await state.clear()
+    args = _args(message)
+    if len(args) != 1 or not args[0].isascii() or not args[0].isdecimal():
+        await message.answer("Формат: <code>/balance &lt;telegram_id&gt;</code>")
+        return
+    user_id = int(args[0])
+    try:
+        balance = await db.get_user_balance(user_id)
+    except UserNotFound:
+        await message.answer("Пользователь ещё не запускал бота.")
+        return
+    await message.answer(
+        f"💰 Баланс <code>{user_id}</code>: <b>{format_usdt(balance)} USDT</b>"
+    )
+
+
+async def _adjust_customer_balance_command(
+    message: Message,
+    db: Database,
+    config: Config,
+    state: FSMContext,
+    *,
+    direction: int,
+) -> None:
+    if not await _authorized(message, config):
+        return
+    await state.clear()
+    parts = (message.text or "").split(maxsplit=3)
+    command = "addbalance" if direction > 0 else "subbalance"
+    if (
+        len(parts) < 3
+        or not parts[1].isascii()
+        or not parts[1].isdecimal()
+    ):
+        await message.answer(
+            f"Формат: <code>/{command} &lt;telegram_id&gt; &lt;USDT&gt; "
+            "[примечание]</code>"
+        )
+        return
+    user_id = int(parts[1])
+    amount = _parse_usdt_micros(parts[2])
+    if user_id <= 0 or amount is None:
+        await message.answer(
+            "ID должен быть положительным числом, сумма — положительной, "
+            "не более 6 знаков после запятой."
+        )
+        return
+    note = parts[3].strip() if len(parts) == 4 else ""
+    try:
+        transaction = await db.adjust_user_balance(
+            user_id,
+            direction * amount,
+            admin_id=message.from_user.id,  # type: ignore[union-attr]
+            note=note,
+            idempotency_key=f"admin-balance:{message.chat.id}:{message.message_id}",
+        )
+    except UserNotFound:
+        await message.answer("Пользователь ещё не запускал бота.")
+        return
+    except InsufficientBalance as exc:
+        await message.answer(
+            "Недостаточно средств для списания. Сейчас на балансе: "
+            f"<b>{format_usdt(exc.available)} USDT</b>."
+        )
+        return
+    except (ValueError, ShopDatabaseError) as exc:
+        await message.answer(f"Не удалось изменить баланс: {escape(str(exc))}")
+        return
+    operation = "зачислено" if direction > 0 else "списано"
+    await message.answer(
+        f"✅ Пользователю <code>{user_id}</code> {operation} "
+        f"<b>{format_usdt(amount)} USDT</b>.\n"
+        f"Новый баланс: <b>{format_usdt(transaction.balance_after_usdt_micros)} USDT</b>."
+    )
+    customer = await db.get_user(user_id)
+    if customer is None:
+        return
+    if customer.locale is Locale.EN:
+        notification = (
+            f"💰 Your wallet was {'credited' if direction > 0 else 'debited'} by "
+            f"{format_usdt(amount)} USDT. Current balance: "
+            f"{format_usdt(transaction.balance_after_usdt_micros)} USDT."
+        )
+    else:
+        notification = (
+            f"💰 Ваш кошелёк {'пополнен' if direction > 0 else 'уменьшен'} на "
+            f"{format_usdt(amount)} USDT. Текущий баланс: "
+            f"{format_usdt(transaction.balance_after_usdt_micros)} USDT."
+        )
+    with contextlib.suppress(TelegramAPIError):
+        await message.bot.send_message(user_id, notification)
+
+
+@router.message(Command("addbalance"))
+async def add_customer_balance(
+    message: Message,
+    db: Database,
+    config: Config,
+    state: FSMContext,
+) -> None:
+    await _adjust_customer_balance_command(
+        message,
+        db,
+        config,
+        state,
+        direction=1,
+    )
+
+
+@router.message(Command("subbalance"))
+async def subtract_customer_balance(
+    message: Message,
+    db: Database,
+    config: Config,
+    state: FSMContext,
+) -> None:
+    await _adjust_customer_balance_command(
+        message,
+        db,
+        config,
+        state,
+        direction=-1,
     )
 
 
@@ -1807,8 +2061,42 @@ async def _refund_locked(
     order_id: int,
 ) -> None:
     order = await db.get_order(order_id)
-    if order is None or not order.telegram_payment_charge_id:
-        await message.answer("Заказ или Telegram charge ID не найден.")
+    if order is None:
+        await message.answer("Заказ не найден.")
+        return
+    balance_payment = await db.get_order_balance_payment(order.id)
+    if balance_payment is not None:
+        if order.status not in {OrderStatus.PAID, OrderStatus.DELIVERED}:
+            await message.answer(f"Возврат невозможен из статуса {order.status.value}.")
+            return
+        try:
+            refunded_order = await db.refund_order(order.id)
+        except ShopDatabaseError as exc:
+            await message.answer(f"Не удалось вернуть средства: {escape(str(exc))}")
+            return
+        restored = -balance_payment.delta_usdt_micros
+        balance = await db.get_user_balance(order.user_id)
+        await message.answer(
+            f"✅ Заказ #{refunded_order.id} возвращён. В кошелёк клиента зачислено "
+            f"{format_usdt(restored)} USDT."
+        )
+        customer = await db.get_user(order.user_id)
+        locale = customer.locale if customer is not None else Locale.RU
+        notification = (
+            f"↩️ Refund for order #{order.id}: {format_usdt(restored)} USDT was "
+            f"returned to your wallet. Current balance: {format_usdt(balance)} USDT."
+            if locale is Locale.EN
+            else f"↩️ Возврат за заказ №{order.id}: {format_usdt(restored)} USDT "
+            f"зачислено в кошелёк. Текущий баланс: {format_usdt(balance)} USDT."
+        )
+        with contextlib.suppress(TelegramAPIError):
+            await bot.send_message(order.user_id, notification)
+        return
+    if not order.telegram_payment_charge_id:
+        await message.answer(
+            "У заказа нет автоматического возврата: платеж Binance Pay "
+            "возвращается вручную после проверки."
+        )
         return
     if order.status not in {OrderStatus.PAID, OrderStatus.DELIVERED}:
         await message.answer(f"Возврат невозможен из статуса {order.status.value}.")

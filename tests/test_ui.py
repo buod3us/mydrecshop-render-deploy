@@ -36,6 +36,7 @@ from mydrecshop.handlers.admin import (
 from mydrecshop.handlers.user import (
     BinancePaymentState,
     RequiredSubscriptionMiddleware,
+    WalletDepositState,
     change_purchase_quantity,
     checkout,
     pre_checkout,
@@ -163,11 +164,13 @@ def test_product_card_uses_premium_emoji_with_unicode_fallback() -> None:
 
 def test_home_keyboard_layout_matches_screenshot() -> None:
     markup = home_keyboard("ru", config(), use_custom_icons=False)
-    assert [len(row) for row in markup.inline_keyboard] == [1, 2, 1]
+    assert [len(row) for row in markup.inline_keyboard] == [1, 2, 1, 1]
     assert markup.inline_keyboard[0][0].text == "🛒 Каталог"
     assert markup.inline_keyboard[1][0].text == "📦 Мои заказы"
     assert markup.inline_keyboard[1][1].text == "👤 Профиль"
-    assert markup.inline_keyboard[2][0].text == "🌍 Сменить язык"
+    assert markup.inline_keyboard[2][0].text == "💰 Кошелёк"
+    assert markup.inline_keyboard[2][0].callback_data == "wallet:open"
+    assert markup.inline_keyboard[3][0].text == "🌍 Сменить язык"
 
 
 def test_admin_has_private_settings_button_in_home_menu() -> None:
@@ -1033,8 +1036,10 @@ async def test_subscription_middleware_clears_non_subscriber_storefront_state(
 
 
 @pytest.mark.asyncio
-async def test_subscription_middleware_allows_critical_binance_payment_callbacks(
+@pytest.mark.parametrize("callback_data", ["bpay:123", "bopen:123", "bdep:sent:123"])
+async def test_subscription_middleware_allows_critical_payment_callbacks(
     monkeypatch,
+    callback_data: str,
 ) -> None:
     middleware = RequiredSubscriptionMiddleware()
     handler = AsyncMock(return_value="handled")
@@ -1046,7 +1051,7 @@ async def test_subscription_middleware_allows_critical_binance_payment_callbacks
         from_user=message.from_user,
         chat_instance="private-chat",
         message=message,
-        data="bpay:123",
+        data=callback_data,
     )
 
     result = await middleware(
@@ -1066,15 +1071,23 @@ async def test_subscription_middleware_allows_critical_binance_payment_callbacks
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "critical_state",
+    [
+        BinancePaymentState.transfer_id.state,
+        WalletDepositState.transfer_id.state,
+    ],
+)
 async def test_subscription_middleware_allows_transfer_id_fsm_completion(
     monkeypatch,
+    critical_state: str,
 ) -> None:
     middleware = RequiredSubscriptionMiddleware()
     handler = AsyncMock(return_value="handled")
     verify = AsyncMock(return_value=False)
     monkeypatch.setattr(user_handlers.subscription_verifier, "is_subscribed", verify)
     state = SimpleNamespace(
-        get_state=AsyncMock(return_value=BinancePaymentState.transfer_id.state),
+        get_state=AsyncMock(return_value=critical_state),
         clear=AsyncMock(),
     )
 
