@@ -13,6 +13,7 @@ from .callbacks import (
     BalanceDepositCallback,
     BalancePayCallback,
     BuyCallback,
+    CancelOrderCallback,
     ConfirmBinanceCallback,
     CustomQuantityCallback,
     DeliverAccountCallback,
@@ -670,6 +671,15 @@ def binance_payment_keyboard(
                     callback_data=SubmitBinanceCallback(order_id=order_id).pack(),
                     fallback_icon="✅",
                     custom_emoji_id=icons.get("payment"),
+                    use_custom_icons=use_custom_icons,
+                )
+            ],
+            [
+                _button(
+                    label=t("order.cancel", locale),
+                    callback_data=CancelOrderCallback(order_id=order_id).pack(),
+                    fallback_icon="❌",
+                    custom_emoji_id=icons.get("cancel"),
                     use_custom_icons=use_custom_icons,
                 )
             ],

@@ -3390,15 +3390,14 @@ class Database:
         allow_submitted_transfer: bool = False,
         now: datetime | None = None,
     ) -> Order:
-        """Let an administrator cancel a pending order and return its reservation."""
+        """Cancel an awaiting order and atomically return its reservation.
 
-        # Customer-side cancellation is intentionally forbidden.  A checkout
-        # reservation may be released only by the ten-minute expiry worker or
-        # by an administrator decision.
-        if user_id is not None:
-            raise InvalidOrderTransition(
-                f"customer {user_id} cannot manually cancel order {order_id}"
-            )
+        Administrators may also reject an order that already has a submitted
+        transfer ID by passing ``allow_submitted_transfer``.  A customer may
+        cancel only their own still-pending order, and never after a transfer
+        ID has been stored.  A bare ``I paid`` claim is deliberately *not* a
+        transfer ID, so the customer can still abandon that checkout safely.
+        """
 
         current_db = _to_db_datetime(_as_utc(now or _utc_now()))
         async with self._lock:
@@ -3411,14 +3410,27 @@ class Database:
                     raise InvalidOrderTransition(
                         f"cannot cancel order {order.id} from status {order.status}"
                     )
-                if (
+                if user_id is not None:
+                    if order.binance_transfer_id is not None:
+                        raise InvalidOrderTransition(
+                            f"cannot cancel order {order.id}: transfer is awaiting admin review"
+                        )
+                    if order.checkout_approved_at is not None:
+                        raise InvalidOrderTransition(
+                            f"cannot cancel order {order.id}: Telegram checkout is approved"
+                        )
+                elif (
                     order.binance_transfer_id is not None
                     or order.payment_claimed_at is not None
                 ) and not allow_submitted_transfer:
                     raise InvalidOrderTransition(
                         f"cannot cancel order {order.id}: transfer is awaiting admin review"
                     )
-                if order.checkout_approved_at is not None and not allow_submitted_transfer:
+                if (
+                    user_id is None
+                    and order.checkout_approved_at is not None
+                    and not allow_submitted_transfer
+                ):
                     raise InvalidOrderTransition(
                         f"cannot cancel order {order.id}: Telegram approved checkout"
                     )

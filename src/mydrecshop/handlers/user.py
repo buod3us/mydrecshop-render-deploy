@@ -42,8 +42,10 @@ from ..db import (
     Database,
     InsufficientBalance,
     InsufficientStock,
+    InvalidOrderTransition,
     LatePaymentRequiresRefund,
     MaintenanceEnabled,
+    OrderNotFound,
     PendingBalanceDepositExists,
     PendingOrderExists,
     ProductPriceChanged,
@@ -2182,13 +2184,44 @@ async def cancel_order(
     callback_data: CancelOrderCallback,
     db: Database,
     config: Config,
+    state: FSMContext,
 ) -> None:
-    # Old messages can still contain the former cancel button.  Keep this
-    # callback as a non-mutating compatibility guard so a crafted/stale
-    # callback can never release a live reservation.
-    del callback_data
     user = await _ensure_user(callback.from_user, db, config)
+    try:
+        order = await db.cancel_order(
+            callback_data.order_id,
+            user_id=user.telegram_id,
+        )
+    except OrderNotFound:
+        await callback.answer(t("order.not_found", user.locale.value), show_alert=True)
+        return
+    except InvalidOrderTransition:
+        await callback.answer(t("order.cannot_cancel", user.locale.value), show_alert=True)
+        return
+    except ShopDatabaseError:
+        await callback.answer(t("order.cannot_cancel", user.locale.value), show_alert=True)
+        return
+
+    await state.clear()
     await callback.answer(
-        t("order.manual_cancel_disabled", user.locale.value),
+        t("order.cancelled", user.locale.value, order_id=order.id),
         show_alert=True,
+    )
+    message = _message_from_callback(callback)
+    if message is None:
+        return
+    product = await db.get_product(order.product_id)
+    if product is None:
+        with contextlib.suppress(TelegramAPIError):
+            await message.edit_reply_markup(reply_markup=None)
+        return
+    await edit_shop_screen(
+        message,
+        lambda custom: order_text(
+            order,
+            product,
+            user.locale.value,
+            use_custom_emoji=custom,
+        ),
+        lambda custom: order_keyboard(order, user.locale.value, config, custom),
     )

@@ -655,15 +655,29 @@ async def test_admin_cancel_or_reject_releases_reserved_accounts(
         assert await database.count_inventory_items(product.id) == 0
         assert _inventory_reserved_for_order(path, order.id) == 3
 
-        with pytest.raises(InvalidOrderTransition):
-            await database.cancel_order(order.id, user_id=order.user_id)
-        assert (await database.get_product(product.id)).stock == 0  # type: ignore[union-attr]
-        assert _inventory_reserved_for_order(path, order.id) == 3
+        if submitted:
+            with pytest.raises(InvalidOrderTransition):
+                await database.cancel_order(order.id, user_id=order.user_id)
+            assert (await database.get_product(product.id)).stock == 0  # type: ignore[union-attr]
+            assert _inventory_reserved_for_order(path, order.id) == 3
+        else:
+            customer_cancelled = await database.cancel_order(
+                order.id,
+                user_id=order.user_id,
+                now=NOW + timedelta(minutes=1),
+            )
+            assert customer_cancelled.status is OrderStatus.CANCELLED
+            assert (await database.get_product(product.id)).stock == 3  # type: ignore[union-attr]
+            assert _inventory_reserved_for_order(path, order.id) == 0
 
-        cancelled = await database.cancel_order(
-            order.id,
-            allow_submitted_transfer=submitted,
-            now=NOW + timedelta(minutes=1),
+        cancelled = (
+            customer_cancelled
+            if not submitted
+            else await database.cancel_order(
+                order.id,
+                allow_submitted_transfer=True,
+                now=NOW + timedelta(minutes=1),
+            )
         )
 
         restored = await database.get_product(product.id)

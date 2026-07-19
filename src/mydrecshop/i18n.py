@@ -386,10 +386,7 @@ _RU: dict[str, str] = {
     "order.cancel": "❌ Отменить заказ",
     "order.cancelled": "Заказ №{order_id} отменён. Резерв товара снят.",
     "order.cannot_cancel": "Этот заказ уже нельзя отменить.",
-    "order.manual_cancel_disabled": (
-        "Заказ нельзя отменить вручную. Если вы не нажмёте «Я оплатил», "
-        "резерв освободится автоматически через 10 минут."
-    ),
+    "order.manual_cancel_disabled": "Этот заказ уже нельзя отменить.",
     "order.open_payment": "Открыть реквизиты Binance Pay",
     "order.not_found": "Заказ не найден или вам недоступен.",
     "order.reservation_expired": (
@@ -703,10 +700,7 @@ _EN: dict[str, str] = {
     "order.cancel": "❌ Cancel order",
     "order.cancelled": "Order #{order_id} has been cancelled. Its stock reservation was released.",
     "order.cannot_cancel": "This order can no longer be cancelled.",
-    "order.manual_cancel_disabled": (
-        "Orders cannot be cancelled manually. If you do not tap 'I paid', the "
-        "reservation will be released automatically after 10 minutes."
-    ),
+    "order.manual_cancel_disabled": "This order can no longer be cancelled.",
     "order.open_payment": "Open Binance Pay details",
     "order.not_found": "The order was not found or you do not have access to it.",
     "order.reservation_expired": (

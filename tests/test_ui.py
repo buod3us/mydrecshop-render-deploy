@@ -18,6 +18,7 @@ from cryptography.fernet import Fernet
 import mydrecshop.handlers.user as user_handlers
 from mydrecshop.app import _drain_background_tasks, _set_commands
 from mydrecshop.callbacks import (
+    CancelOrderCallback,
     PurchaseCheckoutCallback,
     QuantityCallback,
     SubmitBinanceCallback,
@@ -311,6 +312,35 @@ def test_purchase_has_no_terms_step() -> None:
         if (button.callback_data or "").startswith("pchk:")
     )
     assert "Перейти к оплате" in checkout.text
+
+
+@pytest.mark.asyncio
+async def test_customer_cancel_callback_clears_checkout_state() -> None:
+    now = datetime.now(UTC)
+    user = User(telegram_id=123, locale=Locale.EN, created_at=now, updated_at=now)
+    db = SimpleNamespace(
+        get_or_create_user=AsyncMock(return_value=user),
+        cancel_order=AsyncMock(return_value=SimpleNamespace(id=77, product_id=12)),
+    )
+    callback = SimpleNamespace(
+        from_user=TelegramUser(id=123, is_bot=False, first_name="Buyer"),
+        message=None,
+        answer=AsyncMock(),
+    )
+    state = AsyncMock()
+
+    await user_handlers.cancel_order(
+        callback,
+        CancelOrderCallback(order_id=77),
+        db,
+        config(default_locale="en"),
+        state,
+    )
+
+    db.cancel_order.assert_awaited_once_with(77, user_id=123)
+    state.clear.assert_awaited_once_with()
+    assert callback.answer.await_args.kwargs["show_alert"] is True
+    assert "cancelled" in callback.answer.await_args.args[0].lower()
 
 
 def test_purchase_has_wholesale_presets_and_custom_quantity() -> None:

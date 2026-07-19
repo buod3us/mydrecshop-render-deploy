@@ -675,6 +675,42 @@ async def test_admin_cancellation_is_idempotent_and_returns_reserved_stock(
 
 
 @pytest.mark.asyncio
+async def test_customer_can_cancel_after_i_paid_claim_without_transfer_id(
+    database: Database,
+) -> None:
+    product = await _inventory_product(database, "customer-cancel-after-claim")
+    await database.add_inventory_items(product.id, ["claim-account"])
+    order = await database.create_order(
+        60_002,
+        product.id,
+        invoice_payload="customer-cancel-after-claim",
+        now=NOW,
+    )
+    prepared = await database.prepare_binance_order(order.id, product.legacy_usdt_micros)
+    claimed = await database.acknowledge_binance_payment(
+        order.id,
+        order.user_id,
+        now=NOW + timedelta(minutes=1),
+    )
+
+    assert claimed.payment_claimed_at is not None
+    assert claimed.binance_transfer_id is None
+    assert claimed.reservation_expires_at is not None
+
+    cancelled = await database.cancel_order(
+        order.id,
+        user_id=order.user_id,
+        now=NOW + timedelta(minutes=2),
+    )
+
+    restored = await database.get_product(product.id)
+    assert prepared.payment_note is not None
+    assert cancelled.status is OrderStatus.CANCELLED
+    assert restored is not None and restored.stock == 1
+    assert await database.count_inventory_items(product.id) == 1
+
+
+@pytest.mark.asyncio
 async def test_cleanup_expires_due_reservation_and_returns_stock_once(
     database: Database,
 ) -> None:

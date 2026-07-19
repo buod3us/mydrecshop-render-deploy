@@ -253,9 +253,11 @@ def test_all_customer_action_buttons_use_the_curated_theme() -> None:
     ]
     assert action_buttons
     assert all(button.icon_custom_emoji_id for button in action_buttons)
-    assert all(
-        not (button.callback_data or "").startswith("cnl:") for button in buttons
-    )
+    cancel_buttons = [
+        button for button in buttons if (button.callback_data or "").startswith("cnl:")
+    ]
+    assert len(cancel_buttons) == 1
+    assert cancel_buttons[0].icon_custom_emoji_id
     quantity_label = next(
         button for button in buttons if button.callback_data == "purchase_quantity_noop"
     )
