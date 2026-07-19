@@ -8,6 +8,7 @@ import pytest
 import pytest_asyncio
 
 from mydrecshop.db import (
+    CURRENT_SCHEMA_VERSION,
     Database,
     InsufficientInventory,
     InsufficientStock,
@@ -32,7 +33,7 @@ HOTMAIL_SKU = "hotmail-outlook-mail"
 @pytest_asyncio.fixture
 async def database(tmp_path: Path) -> AsyncIterator[Database]:
     database = Database(tmp_path / "shop.sqlite3")
-    await database.initialize()
+    await database.initialize(default_sales_enabled=True)
     await seed_catalog(database)
     hotmail = await database.get_product_by_sku(HOTMAIL_SKU)
     assert hotmail is not None
@@ -179,7 +180,7 @@ async def test_binance_review_queue_keeps_transfer_and_removes_rejected_order(
 async def test_online_backup_is_readable(database: Database, tmp_path: Path) -> None:
     backup_path = await database.backup_to(tmp_path / "backup.sqlite3")
     restored = Database(backup_path)
-    await restored.initialize()
+    await restored.initialize(default_sales_enabled=True)
     try:
         hotmail = await restored.get_product_by_sku(HOTMAIL_SKU)
         assert hotmail is not None
@@ -209,7 +210,7 @@ async def test_file_backup_does_not_wait_for_primary_connection_lock(
 async def test_initialize_migrates_legacy_checkout_columns(tmp_path: Path) -> None:
     path = tmp_path / "legacy.sqlite3"
     original = Database(path)
-    await original.initialize()
+    await original.initialize(default_sales_enabled=True)
     await original.close()
 
     connection = sqlite3.connect(path)
@@ -222,7 +223,7 @@ async def test_initialize_migrates_legacy_checkout_columns(tmp_path: Path) -> No
     connection.close()
 
     migrated = Database(path)
-    await migrated.initialize()
+    await migrated.initialize(default_sales_enabled=True)
     await seed_catalog(migrated)
     try:
         await migrated.get_or_create_user(12_345)
@@ -248,7 +249,7 @@ async def test_inventory_migration_removes_phantom_stock_and_pending_orders(
 ) -> None:
     path = tmp_path / "phantom-stock.sqlite3"
     original = Database(path)
-    await original.initialize()
+    await original.initialize(default_sales_enabled=True)
     await seed_catalog(original)
     product = await original.get_product_by_sku(HOTMAIL_SKU)
     assert product is not None
@@ -274,7 +275,7 @@ async def test_inventory_migration_removes_phantom_stock_and_pending_orders(
     connection.close()
 
     migrated = Database(path)
-    await migrated.initialize()
+    await migrated.initialize(default_sales_enabled=True)
     try:
         migrated_product = await migrated.get_product(product.id)
         migrated_order = await migrated.get_order(order.id)
@@ -1204,7 +1205,7 @@ async def test_deleted_seed_product_stays_deleted_after_reseed_and_restart(
     tmp_path: Path,
 ) -> None:
     database = Database(tmp_path / "reseed-deleted.sqlite3")
-    await database.initialize()
+    await database.initialize(default_sales_enabled=True)
     await seed_catalog(database)
     product = await database.get_product_by_sku("chatgpt-plus-1m-fw")
     assert product is not None
@@ -1213,7 +1214,7 @@ async def test_deleted_seed_product_stays_deleted_after_reseed_and_restart(
     await seed_catalog(database)
     await seed_catalog(database, replace_inventory=True)
     await database.close()
-    await database.initialize()
+    await database.initialize(default_sales_enabled=True)
     await seed_catalog(database)
 
     stored = await database.get_product_by_sku(product.sku)
@@ -1317,7 +1318,7 @@ async def test_delivered_order_history_survives_product_delete(database: Databas
 async def test_initialize_migrates_v4_products_to_soft_delete_schema(tmp_path: Path) -> None:
     path = tmp_path / "v4-products.sqlite3"
     original = Database(path)
-    await original.initialize()
+    await original.initialize(default_sales_enabled=True)
     await seed_catalog(original)
     await original.close()
 
@@ -1329,7 +1330,7 @@ async def test_initialize_migrates_v4_products_to_soft_delete_schema(tmp_path: P
     connection.close()
 
     migrated = Database(path)
-    await migrated.initialize()
+    await migrated.initialize(default_sales_enabled=True)
     try:
         product = await migrated.get_product_by_sku("chatgpt-plus-1m-fw")
         assert product is not None
@@ -1345,7 +1346,7 @@ async def test_initialize_migrates_v4_products_to_soft_delete_schema(tmp_path: P
             "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
             ("idx_products_catalog",),
         ).fetchone()
-        assert version == (7,)
+        assert version == (CURRENT_SCHEMA_VERSION,)
         assert index_sql is not None
         assert "deleted_at IS NULL" in str(index_sql[0])
     finally:

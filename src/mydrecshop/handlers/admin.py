@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import re
 import uuid
 from collections import defaultdict
 from datetime import UTC, datetime
@@ -30,6 +31,7 @@ from ..callbacks import (
 )
 from ..config import Config
 from ..db import (
+    MAX_ORDER_QUANTITY,
     Database,
     InsufficientInventory,
     InvalidOrderTransition,
@@ -71,6 +73,7 @@ class AdminProductState(StatesGroup):
     restock_items = State()
     edit_name = State()
     edit_price = State()
+    edit_wholesale_prices = State()
     edit_description = State()
     edit_guarantee = State()
     remove_stock = State()
@@ -103,6 +106,32 @@ def _parse_usdt_micros(raw: str) -> int | None:
         return None
 
 
+def _parse_wholesale_price_tiers(raw: str) -> tuple[tuple[int, int], ...] | None:
+    normalized = raw.strip()
+    if normalized.casefold() in {"off", "нет", "выкл", "disable"}:
+        return ()
+    lines = [line.strip() for line in normalized.splitlines() if line.strip()]
+    if not lines or len(lines) > 20:
+        return None
+    parsed: list[tuple[int, int]] = []
+    seen: set[int] = set()
+    for line in lines:
+        parts = re.split(r"\s*[=:]\s*", line, maxsplit=1)
+        if len(parts) != 2 or not parts[0].isascii() or not parts[0].isdecimal():
+            return None
+        minimum = int(parts[0])
+        price = _parse_usdt_micros(parts[1])
+        if (
+            price is None
+            or not 2 <= minimum <= MAX_ORDER_QUANTITY
+            or minimum in seen
+        ):
+            return None
+        seen.add(minimum)
+        parsed.append((minimum, price))
+    return tuple(sorted(parsed))
+
+
 def _translation_note(result: LocalizationResult) -> str:
     source = "русский" if result.source_locale is Locale.RU else "английский"
     target = "английский" if result.source_locale is Locale.RU else "русский"
@@ -116,6 +145,7 @@ def _translation_note(result: LocalizationResult) -> str:
 
 async def _admin_panel_text(db: Database, config: Config) -> str:
     stats = await db.get_stats()
+    sales_enabled = await db.get_sales_enabled(default=config.payments_enabled)
     return (
         HELP
         + "\n\n"
@@ -128,7 +158,7 @@ async def _admin_panel_text(db: Database, config: Config) -> str:
         + f"Ожидают оплаты: {stats.awaiting_payment}\n"
         + f"Оплачены, ждут выдачи: {stats.paid}\n\n"
         + "Приём платежей Binance Pay: "
-        + ("🟢 включён" if config.payments_enabled else "🔴 выключен")
+        + ("🟢 включён" if sales_enabled else "🔴 выключен")
     )
 
 
@@ -177,12 +207,24 @@ def _admin_product_title(product: Product) -> str:
 
 async def _show_admin_product(message: Message, db: Database, product: Product) -> None:
     stored = await db.count_inventory_items(product.id)
+    price_tiers = await db.get_product_price_tiers(product.id)
+    wholesale = price_tiers[1:]
+    wholesale_text = (
+        "\n".join(
+            f"• от <b>{tier.min_quantity}</b> шт. — "
+            f"<b>{format_usdt(tier.unit_price_usdt_micros)} USDT</b> за шт."
+            for tier in wholesale
+        )
+        if wholesale
+        else "не настроены"
+    )
     status = "🟢 показывается в каталоге" if product.active else "⚫ скрыт из каталога"
     await message.answer(
         f"{_admin_product_title(product)}\n\n"
         f"Описание: {escape(product.description_ru)}\n\n"
         f"SKU: <code>{escape(product.sku)}</code>\n"
         f"Цена: <b>{format_usdt(product.legacy_usdt_micros)} USDT</b>\n"
+        f"Оптовые цены:\n{wholesale_text}\n"
         f"Статус: {status}\n"
         f"Доступно к продаже: <b>{product.stock}</b>\n"
         f"Продано: <b>{product.sold}</b>\n"
@@ -422,6 +464,22 @@ async def admin_action(
         with contextlib.suppress(TelegramAPIError):
             await callback.message.edit_reply_markup(reply_markup=None)
         await callback.message.answer("Рассылка отменена.", reply_markup=admin_panel_keyboard())
+        return
+    if callback_data.action in {"sales_on", "sales_off"}:
+        enabled = callback_data.action == "sales_on"
+        if enabled and re.fullmatch(r"[0-9]{1,32}", config.binance_id) is None:
+            await callback.answer(
+                "Сначала настройте корректный BINANCE_ID, иначе включить продажи нельзя.",
+                show_alert=True,
+            )
+            return
+        await state.clear()
+        await db.set_sales_enabled(enabled, updated_by=callback.from_user.id)
+        await callback.answer("Продажи включены." if enabled else "Продажи выключены.")
+        await callback.message.answer(
+            await _admin_panel_text(db, config),
+            reply_markup=admin_panel_keyboard(),
+        )
         return
     await state.clear()
     await callback.answer()
@@ -697,6 +755,30 @@ async def admin_product_action(
             "Для отмены: /cancel"
         )
         return
+    if callback_data.action == "edit_wholesale_prices":
+        await state.clear()
+        await state.set_state(AdminProductState.edit_wholesale_prices)
+        await state.update_data(product_id=product.id)
+        price_tiers = await db.get_product_price_tiers(product.id)
+        current = price_tiers[1:]
+        current_text = (
+            "\n".join(
+                f"<code>{tier.min_quantity}={format_usdt(tier.unit_price_usdt_micros)}</code>"
+                for tier in current
+            )
+            if current
+            else "не настроены"
+        )
+        await callback.message.answer(
+            f"<b>Оптовые цены: {escape(product.name_ru)}</b>\n\n"
+            f"Обычная цена от 1 шт.: <b>{format_usdt(product.legacy_usdt_micros)} USDT</b>\n"
+            f"Текущие пороги:\n{current_text}\n\n"
+            "Отправьте все пороги одним сообщением, каждый с новой строки:\n"
+            "<code>5=0.90\n10=0.85\n15=0.80</code>\n\n"
+            "Цена при большем количестве не может повышаться. Чтобы убрать все "
+            "оптовые пороги, отправьте <code>off</code>. Для отмены: /cancel"
+        )
+        return
     if callback_data.action == "edit_description":
         await state.clear()
         await state.set_state(AdminProductState.edit_description)
@@ -926,17 +1008,83 @@ async def edit_product_price(
         )
         return
     data = await state.get_data()
+    product_id = int(data["product_id"])
+    try:
+        current_tiers = await db.get_product_price_tiers(product_id)
+    except ShopDatabaseError:
+        await state.clear()
+        await message.answer("Товар больше не существует.", reply_markup=admin_panel_keyboard())
+        return
+    if any(tier.unit_price_usdt_micros > micros for tier in current_tiers[1:]):
+        await message.answer(
+            "Обычная цена не может быть ниже уже настроенной оптовой цены. "
+            "Сначала измените оптовые пороги."
+        )
+        return
     try:
         product = await db.update_product_details(
-            int(data["product_id"]),
+            product_id,
             usdt_price_micros=micros,
         )
+    except ValueError:
+        await message.answer(
+            "Обычная цена не может быть ниже настроенной оптовой цены. "
+            "Сначала измените оптовые пороги."
+        )
+        return
     except ShopDatabaseError:
         await state.clear()
         await message.answer("Товар больше не существует.", reply_markup=admin_panel_keyboard())
         return
     await state.clear()
     await message.answer(f"✅ Цена изменена: {format_usdt(micros)} USDT.")
+    await _show_admin_product(message, db, product)
+
+
+@router.message(AdminProductState.edit_wholesale_prices, ~F.text.startswith("/"))
+async def edit_product_wholesale_prices(
+    message: Message,
+    db: Database,
+    config: Config,
+    state: FSMContext,
+) -> None:
+    if not await _authorized(message, config):
+        return
+    tiers = _parse_wholesale_price_tiers(message.text or "")
+    if tiers is None:
+        await message.answer(
+            "Неверный формат. Отправьте от 1 до 20 строк вида "
+            "<code>5=0.90</code>. Количество — целое число от 2 до 1000, "
+            "цена — положительное число с точностью до 6 знаков."
+        )
+        return
+    data = await state.get_data()
+    product_id = data.get("product_id")
+    if not isinstance(product_id, int):
+        await state.clear()
+        await message.answer("Товар больше не существует.", reply_markup=admin_panel_keyboard())
+        return
+    try:
+        await db.replace_product_price_tiers(product_id, tiers)
+        product = await db.get_product(product_id)
+    except (ShopDatabaseError, ValueError) as exc:
+        if isinstance(exc, ValueError):
+            await message.answer(
+                "Проверьте сетку цен: при увеличении количества цена за штуку "
+                "не должна повышаться и не должна быть выше обычной цены."
+            )
+            return
+        product = None
+    if product is None:
+        await state.clear()
+        await message.answer("Товар больше не существует.", reply_markup=admin_panel_keyboard())
+        return
+    await state.clear()
+    await message.answer(
+        "✅ Оптовые цены отключены."
+        if not tiers
+        else "✅ Оптовые цены сохранены и уже применяются к новым заказам."
+    )
     await _show_admin_product(message, db, product)
 
 
@@ -1392,7 +1540,14 @@ async def set_price(message: Message, db: Database, config: Config, state: FSMCo
     product = await _find_product(message, db, args[0])
     if product is None:
         return
-    updated = await db.set_product_usdt_price(product.sku, micros)
+    try:
+        updated = await db.set_product_usdt_price(product.sku, micros)
+    except ValueError:
+        await message.answer(
+            "Обычная цена не может быть ниже настроенной оптовой цены. "
+            "Сначала измените оптовые пороги в карточке товара."
+        )
+        return
     await message.answer(
         f"✅ {escape(updated.sku)}: "
         f"цена {format_usdt(updated.legacy_usdt_micros)} USDT."

@@ -131,6 +131,14 @@ class Product:
 
 
 @dataclass(frozen=True, slots=True)
+class ProductPriceTier:
+    """A quantity threshold and its per-unit price in integer USDT micros."""
+
+    min_quantity: int
+    unit_price_usdt_micros: int
+
+
+@dataclass(frozen=True, slots=True)
 class InventoryItem:
     id: int
     product_id: int

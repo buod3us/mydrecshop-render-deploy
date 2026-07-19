@@ -39,8 +39,10 @@ from ..db import (
     InsufficientStock,
     LatePaymentRequiresRefund,
     PendingOrderExists,
+    ProductPriceChanged,
     ProductUnavailable,
     ReservationExpired,
+    SalesDisabled,
     ShopDatabaseError,
 )
 from ..formatting import format_usdt
@@ -61,7 +63,7 @@ from ..keyboards import (
     support_keyboard,
 )
 from ..media import edit_shop_screen, send_shop_screen, send_themed_text
-from ..models import OrderStatus, Product, User
+from ..models import OrderStatus, Product, ProductPriceTier, User
 from ..subscription import subscription_verifier
 from ..theme import theme_html
 from ..views import (
@@ -98,6 +100,40 @@ MIN_PURCHASE_QUANTITY = 1
 
 def _maximum_purchase_quantity(product: Product) -> int:
     return min(product.stock, MAX_ORDER_QUANTITY)
+
+
+async def _sales_enabled(db: Database, config: Config) -> bool:
+    getter = getattr(db, "get_sales_enabled", None)
+    if getter is None:
+        return config.payments_enabled
+    return bool(await getter(default=config.payments_enabled))
+
+
+async def _unit_price(db: Database, product: Product, quantity: int) -> int:
+    getter = getattr(db, "get_product_unit_price", None)
+    if getter is None:
+        return product.legacy_usdt_micros
+    return int(await getter(product.id, quantity))
+
+
+async def _price_tiers(db: Database, product: Product) -> tuple[ProductPriceTier, ...]:
+    getter = getattr(db, "get_product_price_tiers", None)
+    if getter is None:
+        return (ProductPriceTier(1, product.legacy_usdt_micros),)
+    return tuple(await getter(product.id))
+
+
+def _sales_disabled_text(locale: str) -> str:
+    return (
+        "🚧 Purchases are temporarily disabled."
+        if locale == "en"
+        else "🚧 Покупки временно выключены."
+    )
+
+
+def _binance_id_configured(config: Config) -> bool:
+    value = config.binance_id
+    return 1 <= len(value) <= 32 and value.isascii() and value.isdecimal()
 
 
 def _binance_payment_text(
@@ -456,12 +492,8 @@ async def unavailable(callback: CallbackQuery, db: Database, config: Config) -> 
         return
     user = await _ensure_user(callback.from_user, db, config)
     text = t("product.unavailable", user.locale.value)
-    if not config.payments_enabled:
-        text = (
-            "🚧 Purchases are temporarily disabled."
-            if user.locale.value == "en"
-            else "🚧 Покупки временно выключены."
-        )
+    if not await _sales_enabled(db, config):
+        text = _sales_disabled_text(user.locale.value)
     await callback.answer(text, show_alert=True)
 
 
@@ -601,6 +633,8 @@ async def show_product(
         return
     await callback.answer()
     timed_reservations, review_reservations = await db.get_product_reservation_counts(product.id)
+    price_tiers = await _price_tiers(db, product)
+    sales_enabled = await _sales_enabled(db, config)
     await edit_shop_screen(
         message,
         lambda custom: product_text(
@@ -609,8 +643,15 @@ async def show_product(
             use_custom_emoji=custom,
             temporarily_reserved=bool(timed_reservations or review_reservations),
             reservation_minutes=config.order_reservation_minutes,
+            price_tiers=price_tiers,
         ),
-        lambda custom: product_keyboard(product, user.locale.value, config, custom),
+        lambda custom: product_keyboard(
+            product,
+            user.locale.value,
+            config,
+            custom,
+            sales_enabled=sales_enabled,
+        ),
     )
 
 
@@ -640,17 +681,13 @@ async def show_purchase(
             show_alert=True,
         )
         return
-    if not config.payments_enabled:
-        text = (
-            "🚧 Purchases are temporarily disabled."
-            if user.locale.value == "en"
-            else "🚧 Покупки временно выключены."
-        )
-        await callback.answer(text, show_alert=True)
+    if not await _sales_enabled(db, config):
+        await callback.answer(_sales_disabled_text(user.locale.value), show_alert=True)
         return
-    if not config.binance_id:
+    if not _binance_id_configured(config):
         await callback.answer("Binance ID не настроен. Обратитесь в поддержку.", show_alert=True)
         return
+    unit_price = await _unit_price(db, product, 1)
     await callback.answer()
     await edit_shop_screen(
         message,
@@ -660,6 +697,7 @@ async def show_purchase(
             config.order_reservation_minutes,
             quantity=1,
             use_custom_emoji=custom,
+            unit_price_usdt_micros=unit_price,
         ),
         lambda custom: purchase_keyboard(
             product.id,
@@ -668,7 +706,7 @@ async def show_purchase(
             custom,
             quantity=1,
             max_quantity=_maximum_purchase_quantity(product),
-            unit_price_usdt_micros=product.legacy_usdt_micros,
+            unit_price_usdt_micros=unit_price,
         ),
     )
 
@@ -696,6 +734,9 @@ async def change_purchase_quantity(
             )
         await callback.answer(text, show_alert=True)
         return
+    if not await _sales_enabled(db, config):
+        await callback.answer(_sales_disabled_text(user.locale.value), show_alert=True)
+        return
     quantity = callback_data.quantity
     if quantity < MIN_PURCHASE_QUANTITY:
         await callback.answer(
@@ -719,6 +760,7 @@ async def change_purchase_quantity(
             show_alert=True,
         )
         return
+    unit_price = await _unit_price(db, product, quantity)
     await callback.answer()
     await edit_shop_screen(
         message,
@@ -728,6 +770,7 @@ async def change_purchase_quantity(
             config.order_reservation_minutes,
             quantity=quantity,
             use_custom_emoji=custom,
+            unit_price_usdt_micros=unit_price,
         ),
         lambda custom: purchase_keyboard(
             product.id,
@@ -736,7 +779,7 @@ async def change_purchase_quantity(
             custom,
             quantity=quantity,
             max_quantity=maximum,
-            unit_price_usdt_micros=product.legacy_usdt_micros,
+            unit_price_usdt_micros=unit_price,
         ),
     )
 
@@ -763,6 +806,9 @@ async def request_custom_purchase_quantity(
                 config.order_reservation_minutes,
             )
         await callback.answer(text, show_alert=True)
+        return
+    if not await _sales_enabled(db, config):
+        await callback.answer(_sales_disabled_text(user.locale.value), show_alert=True)
         return
 
     await state.set_state(PurchaseQuantityState.quantity)
@@ -821,6 +867,10 @@ async def receive_custom_purchase_quantity(
             )
         await message.answer(text)
         return
+    if not await _sales_enabled(db, config):
+        await state.clear()
+        await message.answer(_sales_disabled_text(user.locale.value))
+        return
 
     raw_quantity = (message.text or "").strip()
     if not raw_quantity.isascii() or not raw_quantity.isdecimal():
@@ -860,6 +910,7 @@ async def receive_custom_purchase_quantity(
         )
         return
 
+    unit_price = await _unit_price(db, product, quantity)
     await state.clear()
     await send_themed_text(
         lambda rendered, keyboard: message.answer(rendered, reply_markup=keyboard),
@@ -869,6 +920,7 @@ async def receive_custom_purchase_quantity(
             config.order_reservation_minutes,
             quantity=quantity,
             use_custom_emoji=custom,
+            unit_price_usdt_micros=unit_price,
         ),
         lambda custom: purchase_keyboard(
             product.id,
@@ -877,7 +929,7 @@ async def receive_custom_purchase_quantity(
             custom,
             quantity=quantity,
             max_quantity=maximum,
-            unit_price_usdt_micros=product.legacy_usdt_micros,
+            unit_price_usdt_micros=unit_price,
         ),
     )
 
@@ -925,6 +977,9 @@ async def show_terms_before_checkout(
             show_alert=True,
         )
         return
+    if not await _sales_enabled(db, config):
+        await callback.answer(_sales_disabled_text(user.locale.value), show_alert=True)
+        return
     maximum = _maximum_purchase_quantity(product)
     if not 1 <= callback_data.quantity <= maximum:
         await callback.answer(
@@ -937,6 +992,7 @@ async def show_terms_before_checkout(
             show_alert=True,
         )
         return
+    unit_price = await _unit_price(db, product, callback_data.quantity)
     await callback.answer()
     await edit_shop_screen(
         message,
@@ -948,7 +1004,7 @@ async def show_terms_before_checkout(
             custom,
             quantity=callback_data.quantity,
             max_quantity=maximum,
-            unit_price_usdt_micros=product.legacy_usdt_micros,
+            unit_price_usdt_micros=unit_price,
         ),
     )
 
@@ -1018,7 +1074,8 @@ async def checkout(
         if isinstance(callback_data, PurchaseCheckoutCallback)
         else 0
     )
-    if expected_price and expected_price != product.legacy_usdt_micros:
+    current_unit_price = await _unit_price(db, product, callback_data.quantity)
+    if expected_price and expected_price != current_unit_price:
         await callback.answer(t("purchase.price_changed", locale), show_alert=True)
         await edit_shop_screen(
             message,
@@ -1028,6 +1085,7 @@ async def checkout(
                 config.order_reservation_minutes,
                 quantity=callback_data.quantity,
                 use_custom_emoji=custom,
+                unit_price_usdt_micros=current_unit_price,
             ),
             lambda custom: purchase_keyboard(
                 product.id,
@@ -1036,19 +1094,14 @@ async def checkout(
                 custom,
                 quantity=callback_data.quantity,
                 max_quantity=maximum,
-                unit_price_usdt_micros=product.legacy_usdt_micros,
+                unit_price_usdt_micros=current_unit_price,
             ),
         )
         return
-    if not config.payments_enabled:
-        text = (
-            "🚧 Purchases are temporarily disabled."
-            if locale == "en"
-            else "🚧 Покупки временно выключены."
-        )
-        await callback.answer(text, show_alert=True)
+    if not await _sales_enabled(db, config):
+        await callback.answer(_sales_disabled_text(locale), show_alert=True)
         return
-    if not config.binance_id:
+    if not _binance_id_configured(config):
         await callback.answer("Binance ID не настроен. Обратитесь в поддержку.", show_alert=True)
         return
 
@@ -1059,6 +1112,7 @@ async def checkout(
             product.id,
             quantity=callback_data.quantity,
             reservation_ttl=timedelta(minutes=config.order_reservation_minutes),
+            expected_unit_price_usdt_micros=current_unit_price,
         )
     except InsufficientStock as exc:
         if exc.available > 0:
@@ -1082,6 +1136,12 @@ async def checkout(
         return
     except ProductUnavailable:
         await message.answer(t("product.unavailable", locale))
+        return
+    except SalesDisabled:
+        await message.answer(_sales_disabled_text(locale))
+        return
+    except ProductPriceChanged:
+        await message.answer(t("purchase.price_changed", locale))
         return
     except PendingOrderExists as exc:
         await message.answer(t("payment.pending", locale) + f"\n№{exc.order_id}")

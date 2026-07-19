@@ -165,8 +165,15 @@ async def run(config: Config | None = None) -> None:
         logger.info("Initialized the persistent database from an encrypted snapshot")
 
     db = Database(config.database_path)
-    await db.initialize()
+    await db.initialize(default_sales_enabled=config.payments_enabled)
     await seed_catalog(db)
+    if await db.apply_price_tier_preset_once(
+        marker_key="pricing.chatgpt_plus_wholesale_v1",
+        sku="chatgpt-plus-1m-fw",
+        base_price_usdt_micros=950_000,
+        tiers=((5, 900_000), (10, 850_000), (15, 800_000)),
+    ):
+        logger.info("Applied the initial ChatGPT wholesale price grid")
     await db.cleanup_expired_orders()
 
     bot = Bot(

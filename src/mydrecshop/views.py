@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import UTC
 from html import escape
 
 from .formatting import format_usdt
 from .i18n import Language, LanguageLike, TrustedHTML, normalize_language, t, translator
-from .models import Order, OrderStatus, Product, User
+from .models import Order, OrderStatus, Product, ProductPriceTier, User
 from .theme import theme_html
 
 
@@ -48,6 +49,7 @@ def product_text(
     use_custom_emoji: bool = True,
     temporarily_reserved: bool = False,
     reservation_minutes: int = 10,
+    price_tiers: Sequence[ProductPriceTier] = (),
 ) -> str:
     language = normalize_language(locale)
     if product.stock > 0:
@@ -62,13 +64,18 @@ def product_text(
             f'<tg-emoji emoji-id="{escape(product.custom_emoji_id, quote=True)}">'
             f"{escape(product.emoji)}</tg-emoji>"
         )
-    return t(
+    base_price = (
+        price_tiers[0].unit_price_usdt_micros
+        if price_tiers
+        else product.legacy_usdt_micros
+    )
+    rendered = t(
         key,
         language,
         emoji=emoji,
         name=product.name(language.value),
         description=product.description(language.value),
-        price=format_usdt(product.legacy_usdt_micros),
+        price=format_usdt(base_price),
         currency="USDT",
         stock=product.stock,
         stock_word=translator.plural("unit", product.stock, language),
@@ -88,6 +95,19 @@ def product_text(
         reservation_icon=_theme_value("pending", use_custom_emoji=use_custom_emoji),
         minutes=reservation_minutes,
     )
+    if len(price_tiers) > 1:
+        title = "<b>📊 Оптовые цены за 1 аккаунт:</b>" if language is Language.RU else (
+            "<b>📊 Wholesale prices per account:</b>"
+        )
+        threshold = "от" if language is Language.RU else "from"
+        unit = "шт." if language is Language.RU else "pcs."
+        lines = [
+            f"• {threshold} {tier.min_quantity} {unit} — "
+            f"<b>{format_usdt(tier.unit_price_usdt_micros)} USDT</b>"
+            for tier in price_tiers
+        ]
+        rendered += "\n\n" + title + "\n" + "\n".join(lines)
+    return rendered
 
 
 def language_text(
@@ -199,15 +219,21 @@ def purchase_text(
     *,
     quantity: int = 1,
     use_custom_emoji: bool = True,
+    unit_price_usdt_micros: int | None = None,
 ) -> str:
     language = normalize_language(locale)
+    unit_price = (
+        product.legacy_usdt_micros
+        if unit_price_usdt_micros is None
+        else unit_price_usdt_micros
+    )
     return t(
         "purchase.confirm",
         language,
         name=product.name(language.value),
         quantity=quantity,
-        unit_price=format_usdt(product.legacy_usdt_micros),
-        total=format_usdt(product.legacy_usdt_micros * quantity),
+        unit_price=format_usdt(unit_price),
+        total=format_usdt(unit_price * quantity),
         currency="USDT",
         minutes=minutes,
         buy_icon=_theme_value("buy", use_custom_emoji=use_custom_emoji),

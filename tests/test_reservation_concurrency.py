@@ -53,7 +53,7 @@ async def _create_inventory_product(
 
 async def _open_database(path: Path) -> Database:
     database = Database(path)
-    await database.initialize()
+    await database.initialize(default_sales_enabled=True)
     return database
 
 

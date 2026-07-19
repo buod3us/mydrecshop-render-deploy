@@ -177,9 +177,12 @@ def product_keyboard(
     locale: LanguageLike,
     config: Config,
     use_custom_icons: bool = True,
+    *,
+    sales_enabled: bool | None = None,
 ) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    if product.stock > 0 and product.active and config.payments_enabled:
+    effective_sales_enabled = config.payments_enabled if sales_enabled is None else sales_enabled
+    if product.stock > 0 and product.active and effective_sales_enabled:
         builder.row(
             _button(
                 label=t("product.buy", locale),
@@ -192,7 +195,7 @@ def product_keyboard(
     else:
         unavailable_text = t("product.unavailable", locale)
         unavailable_fallback = "⛔"
-        if not config.payments_enabled:
+        if not effective_sales_enabled:
             unavailable_fallback = "🚧"
             unavailable_text = (
                 "🚧 Purchases temporarily disabled"
@@ -579,6 +582,16 @@ def admin_panel_keyboard() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
+                    text="🟢 Включить продажи",
+                    callback_data=AdminActionCallback(action="sales_on").pack(),
+                ),
+                InlineKeyboardButton(
+                    text="🔴 Выключить продажи",
+                    callback_data=AdminActionCallback(action="sales_off").pack(),
+                ),
+            ],
+            [
+                InlineKeyboardButton(
                     text="➕ Добавить товар",
                     callback_data=AdminActionCallback(action="create").pack(),
                 )
@@ -677,6 +690,15 @@ def admin_product_keyboard(product: Product) -> InlineKeyboardMarkup:
             text="💰 Изменить цену",
             callback_data=AdminProductCallback(
                 action="edit_price",
+                product_id=product.id,
+            ).pack(),
+        )
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text="📊 Настроить оптовые цены",
+            callback_data=AdminProductCallback(
+                action="edit_wholesale_prices",
                 product_id=product.id,
             ).pack(),
         )

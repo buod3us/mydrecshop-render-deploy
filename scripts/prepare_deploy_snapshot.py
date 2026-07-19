@@ -34,7 +34,7 @@ def _online_backup(source: Path, destination: Path) -> None:
 async def _migrate_and_validate(path: Path) -> None:
     database = Database(path)
     try:
-        await database.initialize()
+        await database.initialize(default_sales_enabled=False)
         await database.cleanup_expired_orders()
     finally:
         await database.close()

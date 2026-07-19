@@ -21,6 +21,7 @@ from .models import (
     OrderStatus,
     Product,
     ProductInput,
+    ProductPriceTier,
     StoreStats,
     User,
     UserOrderStats,
@@ -31,7 +32,7 @@ APPROVED_CHECKOUT_TTL = timedelta(minutes=30)
 MAX_CLEANUP_BATCH = 500
 MAX_ORDER_QUANTITY = 1_000
 MAX_SQLITE_INTEGER = 2**63 - 1
-CURRENT_SCHEMA_VERSION = 7
+CURRENT_SCHEMA_VERSION = 8
 
 
 class ShopDatabaseError(RuntimeError):
@@ -44,6 +45,17 @@ class ProductNotFound(ShopDatabaseError):
 
 class ProductUnavailable(ShopDatabaseError):
     pass
+
+
+class SalesDisabled(ShopDatabaseError):
+    pass
+
+
+class ProductPriceChanged(ShopDatabaseError):
+    def __init__(self, *, expected: int, current: int) -> None:
+        self.expected = expected
+        self.current = current
+        super().__init__(f"unit price changed from {expected} to {current} USDT micros")
 
 
 class ProductDeletionBlocked(ShopDatabaseError):
@@ -140,6 +152,25 @@ CREATE TABLE IF NOT EXISTS products (
 
 CREATE INDEX IF NOT EXISTS idx_products_catalog
     ON products(active, sort_order, id);
+
+CREATE TABLE IF NOT EXISTS product_price_tiers (
+    product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+    min_quantity INTEGER NOT NULL CHECK (min_quantity >= 2),
+    unit_price_usdt_micros INTEGER NOT NULL CHECK (unit_price_usdt_micros > 0),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (product_id, min_quantity)
+);
+
+CREATE INDEX IF NOT EXISTS idx_product_price_tiers_lookup
+    ON product_price_tiers(product_id, min_quantity DESC);
+
+CREATE TABLE IF NOT EXISTS shop_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    updated_by INTEGER
+);
 
 CREATE TABLE IF NOT EXISTS orders (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -356,7 +387,29 @@ async def _execute(
     try:
         return cursor.rowcount
     finally:
-        await cursor.close()
+            await cursor.close()
+
+
+async def _assert_base_price_is_compatible(
+    connection: aiosqlite.Connection,
+    product_id: int,
+    base_price_usdt_micros: int,
+) -> None:
+    highest_tier = await _fetchone(
+        connection,
+        """
+        SELECT MAX(unit_price_usdt_micros) AS highest_price
+        FROM product_price_tiers
+        WHERE product_id = ?
+        """,
+        (product_id,),
+    )
+    if (
+        highest_tier is not None
+        and highest_tier["highest_price"] is not None
+        and int(highest_tier["highest_price"]) > base_price_usdt_micros
+    ):
+        raise ValueError("base price cannot be lower than a wholesale tier")
 
 
 class Database:
@@ -383,7 +436,7 @@ class Database:
             await connection.execute("PRAGMA journal_mode = WAL")
             self._connection = connection
 
-    async def initialize(self) -> None:
+    async def initialize(self, *, default_sales_enabled: bool = False) -> None:
         await self.connect()
         async with self._lock:
             connection = self._require_connection()
@@ -396,6 +449,17 @@ class Database:
                     f"{CURRENT_SCHEMA_VERSION}"
                 )
             await connection.executescript(_SCHEMA)
+            await connection.execute(
+                """
+                INSERT INTO shop_settings(key, value, updated_at, updated_by)
+                VALUES ('sales_enabled', ?, ?, NULL)
+                ON CONFLICT(key) DO NOTHING
+                """,
+                (
+                    "1" if default_sales_enabled else "0",
+                    _to_db_datetime(_utc_now()),
+                ),
+            )
             product_columns = {
                 str(row["name"])
                 for row in await _fetchall(connection, "PRAGMA table_info(products)")
@@ -477,6 +541,61 @@ class Database:
             self._connection = None
             if connection is not None:
                 await connection.close()
+
+    async def ensure_sales_enabled(self, default: bool) -> bool:
+        """Create the persistent sales switch once, without overwriting admin changes."""
+
+        now = _to_db_datetime(_utc_now())
+        async with self._lock:
+            connection = self._require_connection()
+            async with self._transaction(connection):
+                await _execute(
+                    connection,
+                    """
+                    INSERT INTO shop_settings(key, value, updated_at, updated_by)
+                    VALUES ('sales_enabled', ?, ?, NULL)
+                    ON CONFLICT(key) DO NOTHING
+                    """,
+                    ("1" if default else "0", now),
+                )
+                row = await _fetchone(
+                    connection,
+                    "SELECT value FROM shop_settings WHERE key = 'sales_enabled'",
+                )
+        return row is not None and str(row["value"]) == "1"
+
+    async def get_sales_enabled(self, *, default: bool = False) -> bool:
+        """Return the runtime sales switch; *default* supports legacy unseeded DBs."""
+
+        async with self._lock:
+            row = await _fetchone(
+                self._require_connection(),
+                "SELECT value FROM shop_settings WHERE key = 'sales_enabled'",
+            )
+        if row is None:
+            return default
+        return str(row["value"]) == "1"
+
+    async def set_sales_enabled(self, enabled: bool, *, updated_by: int | None = None) -> bool:
+        """Persist an idempotent administrator-selected sales state."""
+
+        now = _to_db_datetime(_utc_now())
+        async with self._lock:
+            connection = self._require_connection()
+            async with self._transaction(connection):
+                await _execute(
+                    connection,
+                    """
+                    INSERT INTO shop_settings(key, value, updated_at, updated_by)
+                    VALUES ('sales_enabled', ?, ?, ?)
+                    ON CONFLICT(key) DO UPDATE SET
+                        value = excluded.value,
+                        updated_at = excluded.updated_at,
+                        updated_by = excluded.updated_by
+                    """,
+                    ("1" if enabled else "0", now, updated_by),
+                )
+        return enabled
 
     async def backup_to(self, destination: str | Path) -> Path:
         """Create a consistent online backup without blocking checkout writes.
@@ -987,6 +1106,12 @@ class Database:
                 )
                 if existing is None or existing["deleted_at"] is not None:
                     raise ProductNotFound(f"product {product_id} does not exist")
+                if usdt_price_micros is not None:
+                    await _assert_base_price_is_compatible(
+                        connection,
+                        product_id,
+                        usdt_price_micros,
+                    )
                 await _execute(
                     connection,
                     f"UPDATE products SET {', '.join(assignments)}, updated_at = ? WHERE id = ?",
@@ -1354,7 +1479,7 @@ class Database:
             async with self._transaction(connection):
                 existing = await _fetchone(
                     connection,
-                    "SELECT deleted_at FROM products WHERE sku = ?",
+                    "SELECT id, deleted_at FROM products WHERE sku = ?",
                     (normalized_sku,),
                 )
                 if existing is None or existing["deleted_at"] is not None:
@@ -1382,6 +1507,209 @@ class Database:
     async def set_product_active(self, sku: str, active: bool) -> Product:
         return await self._update_product_column(sku, "active", int(active))
 
+    async def get_product_price_tiers(self, product_id: int) -> tuple[ProductPriceTier, ...]:
+        """Return the base price (1+) followed by configured wholesale thresholds."""
+
+        if product_id <= 0:
+            raise ValueError("product_id must be positive")
+        async with self._lock:
+            connection = self._require_connection()
+            product_row = await _fetchone(
+                connection,
+                "SELECT legacy_usdt_micros, deleted_at FROM products WHERE id = ?",
+                (product_id,),
+            )
+            if product_row is None or product_row["deleted_at"] is not None:
+                raise ProductNotFound(f"product {product_id} does not exist")
+            rows = await _fetchall(
+                connection,
+                """
+                SELECT min_quantity, unit_price_usdt_micros
+                FROM product_price_tiers
+                WHERE product_id = ?
+                ORDER BY min_quantity
+                """,
+                (product_id,),
+            )
+        return (
+            ProductPriceTier(1, int(product_row["legacy_usdt_micros"])),
+            *(
+                ProductPriceTier(
+                    min_quantity=int(row["min_quantity"]),
+                    unit_price_usdt_micros=int(row["unit_price_usdt_micros"]),
+                )
+                for row in rows
+            ),
+        )
+
+    async def get_product_unit_price(self, product_id: int, quantity: int) -> int:
+        if quantity <= 0 or quantity > MAX_ORDER_QUANTITY:
+            raise ValueError(f"quantity must be between 1 and {MAX_ORDER_QUANTITY}")
+        async with self._lock:
+            connection = self._require_connection()
+            product_row = await _fetchone(
+                connection,
+                "SELECT legacy_usdt_micros, deleted_at FROM products WHERE id = ?",
+                (product_id,),
+            )
+            if product_row is None or product_row["deleted_at"] is not None:
+                raise ProductNotFound(f"product {product_id} does not exist")
+            tier_row = await _fetchone(
+                connection,
+                """
+                SELECT unit_price_usdt_micros
+                FROM product_price_tiers
+                WHERE product_id = ? AND min_quantity <= ?
+                ORDER BY min_quantity DESC
+                LIMIT 1
+                """,
+                (product_id, quantity),
+            )
+        if tier_row is not None:
+            return int(tier_row["unit_price_usdt_micros"])
+        return int(product_row["legacy_usdt_micros"])
+
+    async def replace_product_price_tiers(
+        self,
+        product_id: int,
+        tiers: Sequence[tuple[int, int]],
+    ) -> tuple[ProductPriceTier, ...]:
+        """Replace wholesale thresholds while keeping the product's base (1+) price."""
+
+        if product_id <= 0:
+            raise ValueError("product_id must be positive")
+        if len(tiers) > 20:
+            raise ValueError("a product cannot have more than 20 wholesale tiers")
+        normalized = sorted((int(minimum), int(price)) for minimum, price in tiers)
+        if len({minimum for minimum, _price in normalized}) != len(normalized):
+            raise ValueError("wholesale quantity thresholds must be unique")
+        for minimum, price in normalized:
+            if not 2 <= minimum <= MAX_ORDER_QUANTITY:
+                raise ValueError(f"wholesale quantity must be between 2 and {MAX_ORDER_QUANTITY}")
+            if price <= 0 or price > MAX_SQLITE_INTEGER:
+                raise ValueError("wholesale unit price must be positive")
+
+        now = _to_db_datetime(_utc_now())
+        async with self._lock:
+            connection = self._require_connection()
+            async with self._transaction(connection):
+                product_row = await _fetchone(
+                    connection,
+                    "SELECT legacy_usdt_micros, deleted_at FROM products WHERE id = ?",
+                    (product_id,),
+                )
+                if product_row is None or product_row["deleted_at"] is not None:
+                    raise ProductNotFound(f"product {product_id} does not exist")
+                previous_price = int(product_row["legacy_usdt_micros"])
+                for _minimum, price in normalized:
+                    if price > previous_price:
+                        raise ValueError(
+                            "wholesale unit price cannot increase at a higher quantity"
+                        )
+                    previous_price = price
+                await _execute(
+                    connection,
+                    "DELETE FROM product_price_tiers WHERE product_id = ?",
+                    (product_id,),
+                )
+                if normalized:
+                    await connection.executemany(
+                        """
+                        INSERT INTO product_price_tiers(
+                            product_id, min_quantity, unit_price_usdt_micros,
+                            created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?)
+                        """,
+                        [
+                            (product_id, minimum, price, now, now)
+                            for minimum, price in normalized
+                        ],
+                    )
+        return await self.get_product_price_tiers(product_id)
+
+    async def apply_price_tier_preset_once(
+        self,
+        *,
+        marker_key: str,
+        sku: str,
+        base_price_usdt_micros: int,
+        tiers: Sequence[tuple[int, int]],
+    ) -> bool:
+        """Apply a versioned pricing preset once and never overwrite later admin edits."""
+
+        normalized_marker = marker_key.strip()
+        normalized_sku = sku.strip()
+        if not normalized_marker or not normalized_sku:
+            raise ValueError("marker_key and sku must not be empty")
+        if base_price_usdt_micros <= 0:
+            raise ValueError("base price must be positive")
+        normalized = sorted((int(minimum), int(price)) for minimum, price in tiers)
+        if len(normalized) > 20 or len({minimum for minimum, _price in normalized}) != len(
+            normalized
+        ):
+            raise ValueError("invalid wholesale price tiers")
+        previous_price = base_price_usdt_micros
+        for minimum, price in normalized:
+            if not 2 <= minimum <= MAX_ORDER_QUANTITY or price <= 0 or price > previous_price:
+                raise ValueError("invalid wholesale price tier")
+            previous_price = price
+
+        now = _to_db_datetime(_utc_now())
+        async with self._lock:
+            connection = self._require_connection()
+            async with self._transaction(connection):
+                marker = await _fetchone(
+                    connection,
+                    "SELECT 1 FROM shop_settings WHERE key = ?",
+                    (normalized_marker,),
+                )
+                if marker is not None:
+                    return False
+                product_row = await _fetchone(
+                    connection,
+                    "SELECT id, deleted_at FROM products WHERE sku = ?",
+                    (normalized_sku,),
+                )
+                if product_row is None or product_row["deleted_at"] is not None:
+                    return False
+                product_id = int(product_row["id"])
+                await _execute(
+                    connection,
+                    """
+                    UPDATE products
+                    SET legacy_usdt_micros = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (base_price_usdt_micros, now, product_id),
+                )
+                await _execute(
+                    connection,
+                    "DELETE FROM product_price_tiers WHERE product_id = ?",
+                    (product_id,),
+                )
+                if normalized:
+                    await connection.executemany(
+                        """
+                        INSERT INTO product_price_tiers(
+                            product_id, min_quantity, unit_price_usdt_micros,
+                            created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?)
+                        """,
+                        [
+                            (product_id, minimum, price, now, now)
+                            for minimum, price in normalized
+                        ],
+                    )
+                await _execute(
+                    connection,
+                    """
+                    INSERT INTO shop_settings(key, value, updated_at, updated_by)
+                    VALUES (?, '1', ?, NULL)
+                    """,
+                    (normalized_marker, now),
+                )
+        return True
+
     async def _update_product_column(
         self,
         sku: str,
@@ -1406,11 +1734,17 @@ class Database:
             async with self._transaction(connection):
                 existing = await _fetchone(
                     connection,
-                    "SELECT deleted_at FROM products WHERE sku = ?",
+                    "SELECT id, deleted_at FROM products WHERE sku = ?",
                     (normalized_sku,),
                 )
                 if existing is None or existing["deleted_at"] is not None:
                     raise ProductNotFound(f"product {normalized_sku!r} does not exist")
+                if column == "legacy_usdt_micros":
+                    await _assert_base_price_is_compatible(
+                        connection,
+                        int(existing["id"]),
+                        int(value),
+                    )
                 await _execute(
                     connection,
                     f"UPDATE products SET {column} = ?, updated_at = ? WHERE sku = ?",
@@ -1433,6 +1767,7 @@ class Database:
         quantity: int = 1,
         reservation_ttl: timedelta = DEFAULT_RESERVATION_TTL,
         invoice_payload: str | None = None,
+        expected_unit_price_usdt_micros: int | None = None,
         now: datetime | None = None,
     ) -> Order:
         """Atomically reserve stock and create an awaiting-payment order."""
@@ -1445,6 +1780,8 @@ class Database:
             raise ValueError(f"quantity cannot exceed {MAX_ORDER_QUANTITY}")
         if reservation_ttl <= timedelta(0):
             raise ValueError("reservation_ttl must be positive")
+        if expected_unit_price_usdt_micros is not None and expected_unit_price_usdt_micros <= 0:
+            raise ValueError("expected unit price must be positive")
         payload = invoice_payload or f"mydrecshop:{uuid.uuid4().hex}"
         _validate_invoice_payload(payload)
         explicit_current = _as_utc(now) if now is not None else None
@@ -1456,6 +1793,12 @@ class Database:
                     current = explicit_current or _utc_now()
                     current_db = _to_db_datetime(current)
                     expires_db = _to_db_datetime(current + reservation_ttl)
+                    sales_row = await _fetchone(
+                        connection,
+                        "SELECT value FROM shop_settings WHERE key = 'sales_enabled'",
+                    )
+                    if sales_row is None or str(sales_row["value"]) != "1":
+                        raise SalesDisabled("new purchases are disabled")
                     await self._expire_due_in_transaction(
                         connection,
                         current=current,
@@ -1497,6 +1840,30 @@ class Database:
                     available = int(product_row["stock"])
                     if available < quantity:
                         raise InsufficientStock(requested=quantity, available=available)
+                    tier_row = await _fetchone(
+                        connection,
+                        """
+                        SELECT unit_price_usdt_micros
+                        FROM product_price_tiers
+                        WHERE product_id = ? AND min_quantity <= ?
+                        ORDER BY min_quantity DESC
+                        LIMIT 1
+                        """,
+                        (product_id, quantity),
+                    )
+                    unit_usdt_micros = (
+                        int(tier_row["unit_price_usdt_micros"])
+                        if tier_row is not None
+                        else int(product_row["legacy_usdt_micros"])
+                    )
+                    if (
+                        expected_unit_price_usdt_micros is not None
+                        and expected_unit_price_usdt_micros != unit_usdt_micros
+                    ):
+                        raise ProductPriceChanged(
+                            expected=expected_unit_price_usdt_micros,
+                            current=unit_usdt_micros,
+                        )
                     inventory_rows = await _fetchall(
                         connection,
                         """
@@ -1529,7 +1896,7 @@ class Database:
                         raise InsufficientStock(requested=quantity, available=available)
                     unit_price = int(product_row["price_stars"])
                     total_price = unit_price * quantity
-                    total_usdt_micros = int(product_row["legacy_usdt_micros"]) * quantity
+                    total_usdt_micros = unit_usdt_micros * quantity
                     if total_price > MAX_SQLITE_INTEGER or total_usdt_micros > MAX_SQLITE_INTEGER:
                         raise ValueError("order total exceeds the supported database range")
                     payment_note: str | None = None

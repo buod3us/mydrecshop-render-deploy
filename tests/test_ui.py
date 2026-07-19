@@ -30,6 +30,7 @@ from mydrecshop.handlers.admin import (
     _encrypt_backup,
     _notify_restock_users,
     _parse_usdt_micros,
+    _parse_wholesale_price_tiers,
     _product_name_input,
 )
 from mydrecshop.handlers.user import (
@@ -58,7 +59,7 @@ from mydrecshop.keyboards import (
     purchase_keyboard,
     subscription_keyboard,
 )
-from mydrecshop.models import Locale, Product, User
+from mydrecshop.models import Locale, Product, ProductPriceTier, User
 from mydrecshop.subscription import SubscriptionVerifier
 from mydrecshop.views import home_text, product_text, profile_text, purchase_text, terms_text
 
@@ -335,6 +336,42 @@ def test_purchase_quantity_updates_total_and_checkout_callback() -> None:
         if (button.callback_data or "").startswith("pchk:")
     )
     assert checkout.callback_data == "pchk:12:3:100000"
+
+
+def test_wholesale_price_is_rendered_and_used_in_purchase_total() -> None:
+    tiers = (
+        ProductPriceTier(1, 950_000),
+        ProductPriceTier(5, 900_000),
+        ProductPriceTier(10, 850_000),
+        ProductPriceTier(15, 800_000),
+    )
+
+    card_ru = product_text(product(), "ru", price_tiers=tiers)
+    card_en = product_text(product(), "en", price_tiers=tiers)
+    purchase = purchase_text(
+        product(),
+        "ru",
+        10,
+        quantity=15,
+        unit_price_usdt_micros=800_000,
+    )
+
+    assert "Оптовые цены за 1 аккаунт" in card_ru
+    assert "от 15 шт. — <b>0.8 USDT</b>" in card_ru
+    assert "Wholesale prices per account" in card_en
+    assert "Цена за единицу:</b> 0.8 USDT" in purchase
+    assert "Итого:</b> 12 USDT" in purchase
+
+
+def test_admin_wholesale_price_parser_accepts_grid_and_off() -> None:
+    assert _parse_wholesale_price_tiers("5=0.90\n10:0,85\n15=0.80") == (
+        (5, 900_000),
+        (10, 850_000),
+        (15, 800_000),
+    )
+    assert _parse_wholesale_price_tiers("off") == ()
+    assert _parse_wholesale_price_tiers("5=0.90\n5=0.80") is None
+    assert _parse_wholesale_price_tiers("1=0.95") is None
 
 
 @pytest.mark.asyncio
@@ -640,10 +677,24 @@ def test_admin_product_card_exposes_full_management() -> None:
     assert "📝 Изменить описание" in labels
     assert "🛡 Изменить гарантию" not in labels
     assert "💰 Изменить цену" in labels
+    assert "📊 Настроить оптовые цены" in labels
     assert "📥 Добавить аккаунты" in labels
     assert "🧹 Списать аккаунты" in labels
     assert "🙈 Скрыть из каталога" in labels
     assert "🗑 Удалить товар" in labels
+
+
+def test_admin_panel_exposes_runtime_sales_controls() -> None:
+    markup = admin_panel_keyboard()
+    actions = {
+        button.callback_data
+        for row in markup.inline_keyboard
+        for button in row
+        if button.callback_data
+    }
+
+    assert "adm:sales_on" in actions
+    assert "adm:sales_off" in actions
 
 
 def test_admin_delete_confirmation_has_confirm_and_cancel_actions() -> None:

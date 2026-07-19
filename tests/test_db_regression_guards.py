@@ -42,7 +42,7 @@ def _product_input(sku: str, *, stock: int = 0) -> ProductInput:
 
 async def _open_database(path: Path) -> Database:
     database = Database(path)
-    await database.initialize()
+    await database.initialize(default_sales_enabled=True)
     return database
 
 
@@ -227,7 +227,7 @@ async def test_initialize_rejects_database_from_newer_application(tmp_path: Path
     database = Database(path)
     try:
         with pytest.raises(ShopDatabaseError, match="newer than supported"):
-            await database.initialize()
+            await database.initialize(default_sales_enabled=True)
     finally:
         await database.close()
 
