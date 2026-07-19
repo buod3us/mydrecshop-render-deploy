@@ -286,14 +286,21 @@ async def test_submitted_binance_transfer_stops_expiry_and_keeps_stock_reserved(
             order.id,
             product.legacy_usdt_micros * order.quantity,
         )
+        claimed = await database.acknowledge_binance_payment(
+            order.id,
+            order.user_id,
+            now=NOW + timedelta(minutes=1),
+        )
+        assert claimed.reservation_expires_at == NOW + RESERVATION_TTL
         submitted = await database.submit_binance_transfer(
             order.id,
             order.user_id,
             "binance-transfer-120001",
-            now=NOW + timedelta(minutes=1),
+            now=NOW + RESERVATION_TTL - timedelta(seconds=1),
         )
 
         assert submitted.status is OrderStatus.AWAITING_PAYMENT
+        assert submitted.payment_claimed_at == NOW + timedelta(minutes=1)
         assert submitted.reservation_expires_at is None
         assert await database.count_inventory_items(product.id) == 0
         assert _inventory_reserved_for_order(path, order.id) == 2
@@ -322,48 +329,154 @@ async def test_submitted_binance_transfer_stops_expiry_and_keeps_stock_reserved(
 
 
 @pytest.mark.asyncio
-async def test_i_paid_button_stops_timer_before_transfer_id(tmp_path: Path) -> None:
-    path = tmp_path / "i-paid-stops-timer.sqlite3"
+async def test_i_paid_without_transfer_id_keeps_deadline_and_releases_stock(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "i-paid-keeps-timer.sqlite3"
     database = await _open_database(path)
     try:
         product = await _create_inventory_product(
             database,
-            sku="i-paid-stops-timer",
-            units=1,
+            sku="i-paid-keeps-timer",
+            units=5,
         )
         order = await database.create_order(
             125_001,
             product.id,
+            quantity=5,
             reservation_ttl=RESERVATION_TTL,
-            invoice_payload="i-paid-stops-timer:first",
+            invoice_payload="i-paid-keeps-timer:first",
             now=NOW,
         )
-        await database.prepare_binance_order(order.id, product.legacy_usdt_micros)
+        await database.prepare_binance_order(
+            order.id,
+            product.legacy_usdt_micros * order.quantity,
+        )
 
         claimed = await database.acknowledge_binance_payment(
             order.id,
             order.user_id,
-            now=NOW + RESERVATION_TTL - timedelta(seconds=1),
+            now=NOW + timedelta(minutes=1),
         )
 
-        assert claimed.payment_claimed_at == NOW + RESERVATION_TTL - timedelta(seconds=1)
-        assert claimed.reservation_expires_at is None
+        assert claimed.payment_claimed_at == NOW + timedelta(minutes=1)
+        assert claimed.reservation_expires_at == NOW + RESERVATION_TTL
         assert claimed.binance_transfer_id is None
-        assert await database.cleanup_expired_orders(now=NOW + timedelta(days=30)) == 0
+        assert (
+            await database.cleanup_expired_orders(
+                now=NOW + RESERVATION_TTL - timedelta(microseconds=1)
+            )
+            == 0
+        )
         assert (await database.get_product(product.id)).stock == 0  # type: ignore[union-attr]
         assert await database.count_inventory_items(product.id) == 0
-        assert _inventory_reserved_for_order(path, order.id) == 1
-        with pytest.raises(InvalidOrderTransition):
-            await database.cancel_order(order.id, user_id=order.user_id)
+        assert _inventory_reserved_for_order(path, order.id) == 5
 
-        rejected = await database.cancel_order(
-            order.id,
-            allow_submitted_transfer=True,
-            now=NOW + timedelta(days=30),
+        assert (
+            await database.cleanup_expired_orders(now=NOW + RESERVATION_TTL)
+            == 1
         )
-        assert rejected.status is OrderStatus.CANCELLED
-        assert (await database.get_product(product.id)).stock == 1  # type: ignore[union-attr]
+        assert (
+            await database.cleanup_expired_orders(now=NOW + RESERVATION_TTL)
+            == 0
+        )
+        expired = await database.get_order(order.id)
+        assert expired is not None
+        assert expired.status is OrderStatus.EXPIRED
+        assert (await database.get_product(product.id)).stock == 5  # type: ignore[union-attr]
+        assert await database.count_inventory_items(product.id) == 5
         assert _inventory_reserved_for_order(path, order.id) == 0
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_legacy_claim_without_transfer_restores_deadline_and_expires(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "legacy-i-paid-null-deadline.sqlite3"
+    database = await _open_database(path)
+    try:
+        product = await _create_inventory_product(
+            database,
+            sku="legacy-i-paid-null-deadline",
+            units=6,
+        )
+        legacy = await database.create_order(
+            125_011,
+            product.id,
+            quantity=5,
+            reservation_ttl=RESERVATION_TTL,
+            invoice_payload="legacy-i-paid-null-deadline:stuck",
+            now=NOW,
+        )
+        await database.prepare_binance_order(
+            legacy.id,
+            product.legacy_usdt_micros * legacy.quantity,
+        )
+        submitted = await database.create_order(
+            125_013,
+            product.id,
+            quantity=1,
+            reservation_ttl=RESERVATION_TTL,
+            invoice_payload="legacy-i-paid-null-deadline:submitted",
+            now=NOW,
+        )
+        await database.prepare_binance_order(
+            submitted.id,
+            product.legacy_usdt_micros,
+        )
+        submitted = await database.submit_binance_transfer(
+            submitted.id,
+            submitted.user_id,
+            "legacy-control-transfer-id",
+            now=NOW + timedelta(minutes=1),
+        )
+
+        with sqlite3.connect(path) as connection:
+            connection.execute(
+                """
+                UPDATE orders
+                SET payment_claimed_at = ?, reservation_expires_at = NULL
+                WHERE id = ?
+                """,
+                (
+                    (NOW + timedelta(minutes=1)).isoformat(timespec="microseconds"),
+                    legacy.id,
+                ),
+            )
+
+        assert (
+            await database.restore_claimed_order_deadlines(
+                reservation_ttl=RESERVATION_TTL,
+            )
+            == 1
+        )
+        assert (
+            await database.restore_claimed_order_deadlines(
+                reservation_ttl=RESERVATION_TTL,
+            )
+            == 0
+        )
+        repaired = await database.get_order(legacy.id)
+        control = await database.get_order(submitted.id)
+        assert repaired is not None
+        assert repaired.reservation_expires_at == NOW + RESERVATION_TTL
+        assert control is not None
+        assert control.binance_transfer_id == "legacy-control-transfer-id"
+        assert control.reservation_expires_at is None
+
+        assert (
+            await database.cleanup_expired_orders(now=NOW + RESERVATION_TTL)
+            == 1
+        )
+        repaired = await database.get_order(legacy.id)
+        assert repaired is not None
+        assert repaired.status is OrderStatus.EXPIRED
+        assert (await database.get_product(product.id)).stock == 5  # type: ignore[union-attr]
+        assert await database.count_inventory_items(product.id) == 5
+        assert _inventory_reserved_for_order(path, legacy.id) == 0
+        assert _inventory_reserved_for_order(path, submitted.id) == 1
     finally:
         await database.close()
 
@@ -386,6 +499,11 @@ async def test_i_paid_at_deadline_cannot_revive_expired_order(tmp_path: Path) ->
             now=NOW,
         )
         await database.prepare_binance_order(order.id, product.legacy_usdt_micros)
+        await database.acknowledge_binance_payment(
+            order.id,
+            order.user_id,
+            now=NOW + timedelta(minutes=1),
+        )
 
         with pytest.raises(ReservationExpired):
             await database.acknowledge_binance_payment(
@@ -397,7 +515,7 @@ async def test_i_paid_at_deadline_cannot_revive_expired_order(tmp_path: Path) ->
         expired = await database.get_order(order.id)
         assert expired is not None
         assert expired.status is OrderStatus.EXPIRED
-        assert expired.payment_claimed_at is None
+        assert expired.payment_claimed_at == NOW + timedelta(minutes=1)
         assert (await database.get_product(product.id)).stock == 1  # type: ignore[union-attr]
         assert await database.count_inventory_items(product.id) == 1
         assert _inventory_reserved_for_order(path, order.id) == 0
@@ -423,6 +541,11 @@ async def test_late_transfer_id_cannot_revive_expired_order(tmp_path: Path) -> N
             now=NOW,
         )
         await database.prepare_binance_order(order.id, product.legacy_usdt_micros)
+        await database.acknowledge_binance_payment(
+            order.id,
+            order.user_id,
+            now=NOW + timedelta(minutes=1),
+        )
 
         with pytest.raises(ReservationExpired):
             await database.submit_binance_transfer(
@@ -440,6 +563,59 @@ async def test_late_transfer_id_cannot_revive_expired_order(tmp_path: Path) -> N
         assert _inventory_reserved_for_order(path, order.id) == 0
     finally:
         await database.close()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_and_transfer_at_deadline_are_atomic_across_connections(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "cleanup-transfer-deadline-race.sqlite3"
+    first = await _open_database(path)
+    second = await _open_database(path)
+    try:
+        product = await _create_inventory_product(
+            first,
+            sku="cleanup-transfer-deadline-race",
+            units=1,
+        )
+        order = await first.create_order(
+            125_004,
+            product.id,
+            reservation_ttl=RESERVATION_TTL,
+            invoice_payload="cleanup-transfer-deadline-race:first",
+            now=NOW,
+        )
+        await first.prepare_binance_order(order.id, product.legacy_usdt_micros)
+        await first.acknowledge_binance_payment(
+            order.id,
+            order.user_id,
+            now=NOW + timedelta(minutes=1),
+        )
+
+        cleanup_result, submit_result = await asyncio.gather(
+            first.cleanup_expired_orders(now=NOW + RESERVATION_TTL),
+            second.submit_binance_transfer(
+                order.id,
+                order.user_id,
+                "deadline-race-transfer-id",
+                now=NOW + RESERVATION_TTL,
+            ),
+            return_exceptions=True,
+        )
+
+        assert cleanup_result in {0, 1}
+        assert isinstance(submit_result, ReservationExpired)
+        stored = await first.get_order(order.id)
+        assert stored is not None
+        assert stored.status is OrderStatus.EXPIRED
+        assert stored.binance_transfer_id is None
+        assert (await first.get_product(product.id)).stock == 1  # type: ignore[union-attr]
+        assert await first.count_inventory_items(product.id) == 1
+        assert _inventory_reserved_for_order(path, order.id) == 0
+        assert await first.cleanup_expired_orders(now=NOW + RESERVATION_TTL) == 0
+    finally:
+        await second.close()
+        await first.close()
 
 
 @pytest.mark.asyncio

@@ -196,6 +196,36 @@ def test_all_customer_views_have_custom_and_unicode_fallback_modes() -> None:
     assert all("<tg-emoji" not in screen and "{" not in screen for screen in fallback)
 
 
+def test_i_paid_screen_keeps_transfer_id_deadline_visible() -> None:
+    english = _binance_payment_text(
+        locale="en",
+        order_id=11,
+        amount="0.5",
+        binance_id="123456789",
+        payment_note="NOTE-701860",
+        expires_at="13:05 UTC",
+        use_custom_emoji=False,
+        payment_claimed=True,
+    )
+    russian = _binance_payment_text(
+        locale="ru",
+        order_id=13,
+        amount="0.95",
+        binance_id="123456789",
+        payment_note="NOTE-614732",
+        expires_at="13:14 UTC",
+        use_custom_emoji=False,
+        payment_claimed=True,
+    )
+
+    assert "timer is still running" in english
+    assert "Send the transfer ID by 13:05 UTC" in english
+    assert "timer is stopped" not in english
+    assert "таймер продолжает идти" in russian
+    assert "Отправьте ID перевода до 13:14 UTC" in russian
+    assert "таймер остановлен" not in russian
+
+
 def test_all_customer_action_buttons_use_the_curated_theme() -> None:
     item = _product()
     order = _order()

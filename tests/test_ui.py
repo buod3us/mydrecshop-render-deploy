@@ -646,6 +646,7 @@ async def test_i_paid_notifies_admin_before_transfer_id_is_submitted(
         quantity=5,
         manual_amount_usdt_micros=12_500_000,
         payment_note="NOTE-7103",
+        reservation_expires_at=datetime(2026, 7, 19, 13, 14, tzinfo=UTC),
     )
     user = SimpleNamespace(locale=Locale.RU)
     item = product()
@@ -679,6 +680,11 @@ async def test_i_paid_notifies_admin_before_transfer_id_is_submitted(
     text = bot.send_message.await_args.args[1]
     assert "Покупатель нажал «Я оплатил»" in text
     assert "ещё не отправлен" in text
+    assert "таймер продолжает идти" in text
+    assert "13:14 UTC" in text
+    customer_text = callback.message.answer.await_args.args[0]
+    assert "таймер продолжает идти" in customer_text
+    assert "Только после сохранения ID таймер остановится" in customer_text
     markup = bot.send_message.await_args.kwargs["reply_markup"]
     callbacks = [button.callback_data for row in markup.inline_keyboard for button in row]
     assert "bcfm:103" not in callbacks

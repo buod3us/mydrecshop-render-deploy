@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import logging
 import os
+from datetime import timedelta
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
@@ -36,6 +37,14 @@ async def _maintenance(
     reconciliation_alerted: set[str] = set()
     while not stop_event.is_set():
         try:
+            repaired = await db.restore_claimed_order_deadlines(
+                reservation_ttl=timedelta(minutes=config.order_reservation_minutes),
+            )
+            if repaired:
+                logger.warning(
+                    "Restored deadlines for %s claimed orders without transfer IDs",
+                    repaired,
+                )
             expired = await db.cleanup_expired_orders()
             if expired:
                 logger.info("Released %s expired order reservations", expired)
@@ -180,7 +189,17 @@ async def run(config: Config | None = None) -> None:
         tiers=((5, 900_000), (10, 850_000), (15, 800_000)),
     ):
         logger.info("Applied the initial ChatGPT wholesale price grid")
-    await db.cleanup_expired_orders()
+    repaired = await db.restore_claimed_order_deadlines(
+        reservation_ttl=timedelta(minutes=config.order_reservation_minutes),
+    )
+    if repaired:
+        logger.warning(
+            "Restored deadlines for %s claimed orders without transfer IDs",
+            repaired,
+        )
+    expired = await db.cleanup_expired_orders()
+    if expired:
+        logger.info("Released %s expired order reservations during startup", expired)
     await db.cleanup_expired_balance_deposits()
 
     bot = Bot(

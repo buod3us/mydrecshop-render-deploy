@@ -309,7 +309,7 @@ def order_text(
 ) -> str:
     language = normalize_language(locale)
     status_key = f"order.status.{order.status.value}"
-    if order.status is OrderStatus.AWAITING_PAYMENT and order.payment_claimed_at is not None:
+    if order.status is OrderStatus.AWAITING_PAYMENT and order.binance_transfer_id is not None:
         status_key = "order.status.review"
     status = t(status_key, language)  # type: ignore[arg-type]
     not_available = t("common.not_available", language)

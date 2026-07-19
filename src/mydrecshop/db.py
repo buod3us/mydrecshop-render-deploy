@@ -2815,7 +2815,7 @@ class Database:
         *,
         now: datetime | None = None,
     ) -> Order:
-        """Stop the ten-minute timer when the customer taps “I paid”."""
+        """Record “I paid” without stopping the reservation deadline."""
 
         explicit_current = _as_utc(now) if now is not None else None
         expired = False
@@ -2844,8 +2844,7 @@ class Database:
                             connection,
                             """
                             UPDATE orders
-                            SET payment_claimed_at = ?, reservation_expires_at = NULL,
-                                updated_at = ?
+                            SET payment_claimed_at = ?, updated_at = ?
                             WHERE id = ? AND status = ?
                             """,
                             (
@@ -2866,6 +2865,66 @@ class Database:
             raise ReservationExpired(f"reservation for order {order_id} has expired")
         assert result is not None
         return result
+
+    async def restore_claimed_order_deadlines(
+        self,
+        *,
+        reservation_ttl: timedelta = DEFAULT_RESERVATION_TTL,
+        limit: int = MAX_CLEANUP_BATCH,
+    ) -> int:
+        """Repair deadlines removed by versions that stopped the timer on “I paid”."""
+
+        if reservation_ttl <= timedelta(0):
+            raise ValueError("reservation_ttl must be positive")
+        if not 1 <= limit <= MAX_CLEANUP_BATCH:
+            raise ValueError(f"limit must be between 1 and {MAX_CLEANUP_BATCH}")
+        async with self._lock:
+            connection = self._require_connection()
+            async with self._transaction(connection):
+                rows = await _fetchall(
+                    connection,
+                    """
+                    SELECT id, created_at
+                    FROM orders
+                    WHERE status = ?
+                      AND payment_note IS NOT NULL
+                      AND manual_amount_usdt_micros IS NOT NULL
+                      AND payment_claimed_at IS NOT NULL
+                      AND binance_transfer_id IS NULL
+                      AND reservation_expires_at IS NULL
+                      AND telegram_payment_charge_id IS NULL
+                      AND inventory_claimed_at IS NULL
+                    ORDER BY id
+                    LIMIT ?
+                    """,
+                    (OrderStatus.AWAITING_PAYMENT.value, limit),
+                )
+                repaired = 0
+                for row in rows:
+                    created_at = _from_db_datetime(str(row["created_at"]))
+                    assert created_at is not None
+                    repaired += await _execute(
+                        connection,
+                        """
+                        UPDATE orders
+                        SET reservation_expires_at = ?
+                        WHERE id = ?
+                          AND status = ?
+                          AND payment_note IS NOT NULL
+                          AND manual_amount_usdt_micros IS NOT NULL
+                          AND payment_claimed_at IS NOT NULL
+                          AND binance_transfer_id IS NULL
+                          AND reservation_expires_at IS NULL
+                          AND telegram_payment_charge_id IS NULL
+                          AND inventory_claimed_at IS NULL
+                        """,
+                        (
+                            _to_db_datetime(created_at + reservation_ttl),
+                            int(row["id"]),
+                            OrderStatus.AWAITING_PAYMENT.value,
+                        ),
+                    )
+                return repaired
 
     async def submit_binance_transfer(
         self,

@@ -192,8 +192,9 @@ def _binance_payment_text(
                 f"Сумма: <code>{safe_amount} USDT</code>\n"
                 f"Binance ID: <code>{safe_binance_id}</code>\n"
                 f"Note/заметка: <code>{safe_note}</code>\n\n"
-                "Вы уже нажали «Я оплатил»: таймер остановлен, аккаунты остаются "
-                "в резерве. Нажмите кнопку ниже, чтобы отправить ID перевода."
+                "Вы уже нажали «Я оплатил», но таймер продолжает идти. "
+                f"Отправьте ID перевода до {safe_expiry}, иначе заказ отменится "
+                "и аккаунты вернутся в продажу."
             )
         return (
             f"<b>{payment_icon} Оплата заказа №{order_id} через Binance Pay</b>\n\n"
@@ -209,8 +210,9 @@ def _binance_payment_text(
             f"Amount: <code>{safe_amount} USDT</code>\n"
             f"Binance ID: <code>{safe_binance_id}</code>\n"
             f"Note: <code>{safe_note}</code>\n\n"
-            "You already tapped 'I paid': the timer is stopped and the accounts remain "
-            "reserved. Tap the button below to send the transfer ID."
+            "You already tapped 'I paid', but the timer is still running. "
+            f"Send the transfer ID by {safe_expiry}, otherwise the order will expire "
+            "and the accounts will return to stock."
         )
     return (
         f"<b>{payment_icon} Binance Pay order #{order_id}</b>\n\n"
@@ -1756,6 +1758,10 @@ async def request_binance_transfer_id(
     await callback.answer()
     product = await db.get_product(order.product_id)
     amount = format_usdt(order.manual_amount_usdt_micros or 0)
+    expires_at = order.reservation_expires_at
+    rendered_expiry = (
+        expires_at.astimezone(UTC).strftime("%H:%M UTC") if expires_at else "—"
+    )
     admin_text = (
         f"<b>🔔 Покупатель нажал «Я оплатил»</b>\n\n"
         f"Заказ: <b>#{order.id}</b>\n"
@@ -1765,8 +1771,9 @@ async def request_binance_transfer_id(
         f"Сумма: <code>{amount} USDT</code>\n"
         f"Note: <code>{escape(order.payment_note or '—')}</code>\n"
         "ID перевода: <b>ещё не отправлен</b>\n\n"
-        "Резерв остаётся активным до решения администратора. "
-        "Без ID заказ можно отклонить, но нельзя подтвердить."
+        f"ID нужно отправить до <b>{rendered_expiry}</b>. Пока ID не получен, "
+        "10-минутный таймер продолжает идти. После дедлайна заказ автоматически "
+        "отменится, а аккаунты вернутся в продажу."
     )
     for admin_id in config.admin_ids:
         try:
@@ -1783,13 +1790,13 @@ async def request_binance_transfer_id(
             )
     if callback.message:
         await callback.message.answer(
-            "Payment is marked as sent. The 10-minute timer has stopped and "
-            "the accounts remain reserved until the administrator's decision.\n\n"
-            "Send the Binance Pay Transaction ID in one message."
+            "Your click was recorded, but the 10-minute timer is still running. "
+            f"Send the Binance Pay Transaction ID by {rendered_expiry}. Only after "
+            "the ID is saved will the timer stop."
             if user.locale.value == "en"
-            else "Оплата отмечена как отправленная. 10-минутный таймер остановлен, "
-            "аккаунты остаются в резерве до решения администратора.\n\n"
-            "Отправьте одним сообщением ID перевода (Transaction ID) из Binance Pay."
+            else "Нажатие сохранено, но 10-минутный таймер продолжает идти. "
+            f"Отправьте ID перевода Binance Pay до {rendered_expiry}. Только после "
+            "сохранения ID таймер остановится."
         )
 
 
@@ -2131,10 +2138,10 @@ async def reopen_binance_payment(
         await callback.answer(t("order.not_found", user.locale.value), show_alert=True)
         return
 
-    if order.reservation_expires_at is not None:
-        expires_at = order.reservation_expires_at.astimezone(UTC).strftime("%H:%M UTC")
-    else:
-        expires_at = "timer stopped" if user.locale.value == "en" else "таймер остановлен"
+    if order.reservation_expires_at is None:
+        await callback.answer(t("order.not_found", user.locale.value), show_alert=True)
+        return
+    expires_at = order.reservation_expires_at.astimezone(UTC).strftime("%H:%M UTC")
     amount = format_usdt(order.manual_amount_usdt_micros or 0)
     await callback.answer()
     await edit_shop_screen(
